@@ -44,6 +44,20 @@ sync_existing_certificate() {
     fi
 }
 
+renew_ip_certificate() {
+    if openssl x509 -checkend 86400 -noout -in "${install_dir}/certs/fullchain.cer"; then
+        return
+    fi
+    if ss -H -ltnp 'sport = :80' 2>/dev/null | grep -q .; then
+        env PORT80_AUTO_RELEASE="${PORT80_AUTO_RELEASE:-0}" PORT80_OWNER_TYPE="${PORT80_OWNER_TYPE:-}" \
+            PORT80_OWNER_NAME="${PORT80_OWNER_NAME:-}" \
+            "${install_dir}/scripts/with-port80-released.sh" -- \
+            "${acme_home}/acme.sh" --cron --home "${acme_home}"
+    else
+        "${acme_home}/acme.sh" --cron --home "${acme_home}"
+    fi
+}
+
 case "${1:-status}" in
     status)
         compose ps
@@ -75,7 +89,7 @@ case "${1:-status}" in
         if [[ "${TLS_MODE:-ip}" == "existing" ]]; then
             sync_existing_certificate
         else
-            "${acme_home}/acme.sh" --cron --home "${acme_home}"
+            renew_ip_certificate
         fi
         openssl x509 -checkend 86400 -noout -in "${install_dir}/certs/fullchain.cer"
         rm -f "${failure_file}"
