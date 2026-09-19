@@ -108,7 +108,7 @@ sudo /opt/zoe-livesync-server/manage.sh uri
 /opt/zoe-livesync-server/setup-uri-only.txt
 ```
 
-该文件不含标题、说明或保护口令，可以全选后直接粘贴到 Self-hosted LiveSync。脚本会在写出文件前确认 URI 以 `obsidian://setuplivesync?settings=` 开始、整行不含空白字符，并使用同一套官方库反向解密，核对服务器地址、数据库名、用户名、密码、Vault 加密口令及加密状态。加密载荷没有应当硬编码的固定结尾；反向解密校验可以同时发现载荷截断和字段缺失。
+该文件不含标题、说明或保护口令，可以全选后直接粘贴到 Self-hosted LiveSync。脚本会在写出文件前确认 URI 以 `obsidian://setuplivesync?settings=` 开始、整行不含空白字符，并使用 Self-hosted LiveSync 上游项目采用的库反向解密，核对服务器地址、数据库名、用户名、密码、Vault 加密口令及加密状态。加密载荷没有应当硬编码的固定结尾；反向解密校验可以同时发现载荷截断和字段缺失。
 
 安装结束页还会把 URI 中的关键配置解说为可读内容，包括 CouchDB 地址、数据库名、账号、密码、Vault 加密口令、启动同步、60 秒周期复制、文件打开/合并后的同步触发、批量写入方式和活动远程类型。Setup URI 保护口令不在 URI 内，会单独醒目标示。
 
@@ -161,4 +161,4 @@ Obsidian LiveSync → https://服务器IP:随机端口
 
 - CouchDB：`3.5.2.1`
 - Caddy：`2.11.4-alpine`
-- CouchDB 初始化逻辑依据 Self-hosted LiveSync 官方仓库提交 `2c2b9c90e4e10a454f2838c63ba656c0e67a374c` 重写，LiveSync Commonlib 固定为 `0.1.0-rc.4`。
+- CouchDB 初始化逻辑依据第三方社区插件 Self-hosted LiveSync 的上游仓库提交 `2c2b9c90e4e10a454f2838c63ba656c0e67a374c` 重写，LiveSync Commonlib 固定为 `0.1.0-rc.4`。这里的“上游”不代表 Obsidian 官方服务或 Obsidian Sync。

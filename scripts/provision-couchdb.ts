@@ -1,4 +1,4 @@
-// LiveSync-compatible CouchDB provisioning.
+// CouchDB provisioning compatible with the third-party Self-hosted LiveSync plugin.
 // Keep these package versions aligned with the pinned upstream implementation.
 import { checkRemoteVersion } from "npm:@vrtmrz/livesync-commonlib@0.1.0-rc.4/compat/pouchdb/negotiation";
 import { PouchDB } from "npm:@vrtmrz/livesync-commonlib@0.1.0-rc.4/compat/pouchdb/pouchdb-browser";

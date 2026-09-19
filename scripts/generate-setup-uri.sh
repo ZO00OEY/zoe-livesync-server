@@ -77,7 +77,7 @@ cat > "${output_file}" <<EOF
 
 7. 同步周期
    当前值: 开启，每 60 秒一次（periodicReplication=true）
-   意义: Obsidian 打开期间，按官方默认间隔定期检查并交换变更。
+   意义: Obsidian 打开期间，按 Self-hosted LiveSync 上游默认间隔定期检查并交换变更。
 
 8. 复制与触发方式
    周期双向复制: 开启
