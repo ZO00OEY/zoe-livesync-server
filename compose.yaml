@@ -41,18 +41,16 @@ services:
   caddy:
     image: caddy:2.11.4-alpine
     container_name: zoe-livesync-caddy
-    profiles: [standalone]
+    profiles: [https]
     restart: unless-stopped
     depends_on:
       couchdb:
         condition: service_healthy
     ports:
-      - "80:80"
-      - "443:443"
+      - "${HTTPS_PORT:?HTTPS_PORT is required}:443"
     volumes:
       - ./config/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./certs:/certs:ro
-      - ./acme-webroot:/srv/acme:ro
       - caddy-data:/data
       - caddy-config:/config
     networks:

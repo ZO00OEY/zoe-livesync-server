@@ -10,8 +10,7 @@ NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
 PUBLIC_IP="${PUBLIC_IP:-}"
 COUCHDB_USER="${COUCHDB_USER:-obsidian_user}"
 COUCHDB_DATABASE="${COUCHDB_DATABASE:-obsidiannotes}"
-EXISTING_HTTPS_ORIGIN="${EXISTING_HTTPS_ORIGIN:-}"
-INGRESS_MODE=""
+HTTPS_PORT="${HTTPS_PORT:-}"
 PUBLIC_URL=""
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[1;33m'; cyan='\033[0;36m'; reset='\033[0m'
@@ -177,17 +176,17 @@ detect_system() {
 install_base_packages() {
     if command_exists apt-get; then
         apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates openssl iproute2 cron gnupg
+        DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates openssl iproute2 cron gnupg socat
     elif command_exists dnf; then
-        dnf install -y curl ca-certificates openssl iproute cronie
+        dnf install -y curl ca-certificates openssl iproute cronie socat
     elif command_exists yum; then
-        yum install -y curl ca-certificates openssl iproute cronie
+        yum install -y curl ca-certificates openssl iproute cronie socat
     elif command_exists zypper; then
-        zypper --non-interactive install curl ca-certificates openssl iproute2 cron
+        zypper --non-interactive install curl ca-certificates openssl iproute2 cron socat
     elif command_exists pacman; then
-        pacman -Sy --noconfirm curl ca-certificates openssl iproute2 cronie
+        pacman -Sy --noconfirm curl ca-certificates openssl iproute2 cronie socat
     elif command_exists apk; then
-        apk add --no-cache bash curl ca-certificates openssl iproute2 docker docker-cli-compose
+        apk add --no-cache bash curl ca-certificates openssl iproute2 socat dcron docker docker-cli-compose
     else
         die "未识别包管理器，请先安装 curl、openssl、iproute2、cron、Docker 和 Compose。"
     fi
@@ -284,62 +283,49 @@ port_is_busy() {
     ss -H -ltnp "sport = :$1" 2>/dev/null | grep -q .
 }
 
-detect_existing_origin() {
-    local domain ip
-    if [[ -n "${EXISTING_HTTPS_ORIGIN}" ]]; then
-        [[ "${EXISTING_HTTPS_ORIGIN}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || \
-            die "EXISTING_HTTPS_ORIGIN 必须是 https://域名 或 https://IP。"
-        printf '%s' "${EXISTING_HTTPS_ORIGIN%/}"
-        return
+select_https_port() {
+    local stored_port="" candidate
+    if [[ -f "${INSTALL_DIR}/.env" ]]; then
+        stored_port="$(sed -n 's/^HTTPS_PORT=//p' "${INSTALL_DIR}/.env" | head -n 1)"
+    fi
+    [[ -n "${HTTPS_PORT}" ]] || HTTPS_PORT="${stored_port}"
+
+    if [[ -n "${HTTPS_PORT}" ]]; then
+        if [[ ! "${HTTPS_PORT}" =~ ^[0-9]+$ ]] || (( HTTPS_PORT < 1 || HTTPS_PORT > 65535 )); then
+            die "HTTPS_PORT 必须是 1-65535 之间的端口。"
+        fi
+        if port_is_busy "${HTTPS_PORT}"; then
+            if ! docker port zoe-livesync-caddy 443/tcp 2>/dev/null | grep -Eq ":${HTTPS_PORT}$"; then
+                die "指定的 HTTPS 端口 ${HTTPS_PORT} 已被其他服务占用。"
+            fi
+        fi
+    else
+        for candidate in 443 8443 9443 10443; do
+            if ! port_is_busy "${candidate}"; then
+                HTTPS_PORT="${candidate}"
+                break
+            fi
+        done
+        [[ -n "${HTTPS_PORT}" ]] || die "443、8443、9443、10443 均被占用，请通过 HTTPS_PORT 指定空闲端口。"
     fi
 
-    domain="$(sed -n 's/^# 域名: //p' /etc/caddy/Caddyfile 2>/dev/null | head -n 1)"
-    if [[ -n "${domain}" ]]; then
-        printf 'https://%s' "${domain}"
-        return
-    fi
-    ip="$(sed -n 's/^# 公网 IP: //p' /etc/caddy/Caddyfile 2>/dev/null | head -n 1)"
-    if is_public_ipv4 "${ip}"; then
-        printf 'https://%s' "${ip}"
-        return
-    fi
-    die "检测到现有 Caddy，但无法判断 HTTPS 入口。请设置 EXISTING_HTTPS_ORIGIN=https://你的域名 后重跑。"
-}
-
-detect_ingress_mode() {
-    local port80_busy=0 port443_busy=0
-    port_is_busy 80 && port80_busy=1
-    port_is_busy 443 && port443_busy=1
-
-    if (( port80_busy == 0 && port443_busy == 0 )); then
-        INGRESS_MODE="standalone"
-        choose_ip_candidate
+    if [[ "${HTTPS_PORT}" == "443" ]]; then
         PUBLIC_URL="https://${PUBLIC_IP}"
-        info "入口模式：独立 IP 证书（脚本管理 80/443）。"
-        return
+    else
+        PUBLIC_URL="https://${PUBLIC_IP}:${HTTPS_PORT}"
     fi
-
-    if command_exists caddy && [[ -f /etc/caddy/Caddyfile ]] && \
-       { ! command_exists systemctl || systemctl is-active --quiet caddy 2>/dev/null || pgrep -x caddy >/dev/null 2>&1; }; then
-        INGRESS_MODE="existing-caddy"
-        PUBLIC_URL="$(detect_existing_origin)/couchdb"
-        info "入口模式：接入现有 Caddy，不创建第二个 Caddy，不接管 80/443。"
-        info "LiveSync 地址：${PUBLIC_URL}"
-        return
-    fi
-
-    ss -H -ltnp '( sport = :80 or sport = :443 )' 2>/dev/null >&2 || true
-    die "80/443 已被非 Caddy 服务占用；为避免影响现有代理节点，脚本不会接管端口。"
+    info "独立 HTTPS 端口：${HTTPS_PORT}"
+    info "LiveSync 地址：${PUBLIC_URL}"
 }
 
 prepare_files() {
-    mkdir -p "${INSTALL_DIR}"/{config,scripts,certs,acme-webroot}
+    mkdir -p "${INSTALL_DIR}"/{config,scripts,certs}
     install -m 0644 "${SOURCE_DIR}/compose.yaml" "${INSTALL_DIR}/compose.yaml"
     install -m 0644 "${SOURCE_DIR}/config/livesync.ini" "${INSTALL_DIR}/config/livesync.ini"
     install -m 0755 "${SOURCE_DIR}/scripts/couchdb-init.sh" "${INSTALL_DIR}/scripts/couchdb-init.sh"
     install -m 0755 "${SOURCE_DIR}/manage.sh" "${INSTALL_DIR}/manage.sh"
 
-    local password="${COUCHDB_PASSWORD:-}" confirmed_ip="${PUBLIC_IP}" confirmed_url="${PUBLIC_URL}" confirmed_mode="${INGRESS_MODE}"
+    local password="${COUCHDB_PASSWORD:-}" confirmed_ip="${PUBLIC_IP}" confirmed_url="${PUBLIC_URL}" confirmed_port="${HTTPS_PORT}"
     if [[ -f "${INSTALL_DIR}/.env" ]]; then
         # shellcheck source=/dev/null
         source "${INSTALL_DIR}/.env"
@@ -347,7 +333,7 @@ prepare_files() {
     fi
     PUBLIC_IP="${confirmed_ip}"
     PUBLIC_URL="${confirmed_url}"
-    INGRESS_MODE="${confirmed_mode}"
+    HTTPS_PORT="${confirmed_port}"
     [[ -n "${password}" ]] || password="$(openssl rand -hex 32)"
     cat > "${INSTALL_DIR}/.env" <<EOF
 COUCHDB_USER=${COUCHDB_USER}
@@ -355,75 +341,16 @@ COUCHDB_PASSWORD=${password}
 COUCHDB_DATABASE=${COUCHDB_DATABASE}
 PUBLIC_IP=${PUBLIC_IP}
 PUBLIC_URL=${PUBLIC_URL}
-INGRESS_MODE=${INGRESS_MODE}
+HTTPS_PORT=${HTTPS_PORT}
 EOF
     chmod 0600 "${INSTALL_DIR}/.env"
     COUCHDB_PASSWORD="${password}"
-}
-
-integrate_existing_caddy() {
-    local caddyfile="/etc/caddy/Caddyfile"
-    local route_file="/etc/caddy/routes-custom.d/zoe-couchdb.conf"
-    local created=0
-
-    if grep -RqsE 'handle_path[[:space:]]+/couchdb/\*' /etc/caddy 2>/dev/null; then
-        ok "现有 Caddy 已包含 /couchdb/ 路由。"
-        return
-    fi
-
-    if ! grep -q 'routes-custom.d' "${caddyfile}"; then
-        die "现有 Caddy 尚未预留 routes-custom.d 导入点。为避免改坏代理节点，本次不自动改写主 Caddyfile。"
-    fi
-
-    mkdir -p /etc/caddy/routes-custom.d
-    cat > "${route_file}" <<'EOF'
-redir /couchdb /couchdb/ 308
-handle_path /couchdb/* {
-    reverse_proxy 127.0.0.1:5984 {
-        header_up X-Forwarded-Proto https
-        header_up X-Forwarded-For {remote_host}
-        flush_interval -1
-    }
-}
-handle /_session {
-    reverse_proxy 127.0.0.1:5984
-}
-EOF
-    created=1
-    caddy fmt --overwrite "${route_file}" >/dev/null 2>&1 || true
-    if ! caddy validate --config "${caddyfile}" --adapter caddyfile >/dev/null; then
-        (( created == 1 )) && rm -f "${route_file}"
-        die "新增 CouchDB 路由后 Caddy 校验失败，已撤销路由文件。"
-    fi
-    systemctl reload caddy 2>/dev/null || caddy reload --config "${caddyfile}" --adapter caddyfile
-    ok "已把 /couchdb/ 安全接入现有 Caddy。"
-}
-
-write_http_caddyfile() {
-    cat > "${INSTALL_DIR}/config/Caddyfile" <<'EOF'
-{
-    auto_https off
-}
-
-:80 {
-    root * /srv/acme
-    file_server
-}
-EOF
 }
 
 write_https_caddyfile() {
     cat > "${INSTALL_DIR}/config/Caddyfile" <<EOF
 {
     auto_https off
-}
-
-:80 {
-    handle /.well-known/acme-challenge/* {
-        root * /srv/acme
-        file_server
-    }
-    redir https://${PUBLIC_IP}{uri} permanent
 }
 
 https://${PUBLIC_IP} {
@@ -460,8 +387,12 @@ issue_certificate() {
     fi
 
     info "向 Let's Encrypt 申请短期公网 IP 证书。"
+    if port_is_busy 80; then
+        ss -H -ltnp 'sport = :80' 2>/dev/null >&2 || true
+        die "申请公网 IP 证书需要临时使用 80 端口，但该端口当前被占用；脚本不会停止现有服务。"
+    fi
     "${ACME_BIN}" --issue --server letsencrypt -d "${PUBLIC_IP}" \
-        --certificate-profile shortlived --webroot "${INSTALL_DIR}/acme-webroot" --ecc --force
+        --certificate-profile shortlived --standalone --listen-v4 --ecc --force
     "${ACME_BIN}" --install-cert -d "${PUBLIC_IP}" --ecc \
         --fullchain-file "${cert_file}" --key-file "${key_file}" \
         --reloadcmd "/usr/local/sbin/zoe-livesync-reload"
@@ -478,24 +409,39 @@ install_renewal_helpers() {
 set -eu
 cd "${INSTALL_DIR}"
 if docker compose version >/dev/null 2>&1; then
-    docker compose -p zoe-livesync exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+    if docker ps --format '{{.Names}}' | grep -qx zoe-livesync-caddy; then
+        docker compose -p zoe-livesync --profile https exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+    fi
 else
-    docker-compose -p zoe-livesync exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+    if docker ps --format '{{.Names}}' | grep -qx zoe-livesync-caddy; then
+        docker-compose -p zoe-livesync --profile https exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+    fi
 fi
 EOF
     cat > /usr/local/sbin/zoe-livesync-renew <<EOF
 #!/usr/bin/env bash
 set -eu
+if ss -H -ltn 'sport = :80' 2>/dev/null | grep -q .; then
+    echo "80 端口正在使用，跳过本轮 IP 证书续期；未停止任何现有服务"
+    exit 1
+fi
 "${ACME_BIN}" --cron --home "${ACME_HOME}"
 openssl x509 -checkend 86400 -noout -in "${INSTALL_DIR}/certs/fullchain.cer"
 EOF
     chmod 0755 /usr/local/sbin/zoe-livesync-reload /usr/local/sbin/zoe-livesync-renew
+    local current_cron
+    current_cron="$(crontab -l 2>/dev/null || true)"
+    printf '%s\n' "${current_cron}" | awk '!(index($0, "acme.sh") && index($0, "--cron"))' | \
+        sed '/^[[:space:]]*$/d' | crontab -
     cat > /etc/cron.d/zoe-livesync-renew <<'EOF'
 17 */12 * * * root /usr/local/sbin/zoe-livesync-renew >> /var/log/zoe-livesync-renew.log 2>&1
 EOF
     chmod 0644 /etc/cron.d/zoe-livesync-renew
     command_exists systemctl && systemctl enable --now cron >/dev/null 2>&1 || \
         command_exists systemctl && systemctl enable --now crond >/dev/null 2>&1 || true
+    if ! command_exists systemctl && command_exists crond && ! pgrep -x crond >/dev/null 2>&1; then
+        crond
+    fi
 }
 
 wait_for_couchdb() {
@@ -526,12 +472,10 @@ EOF
 }
 
 verify_installation() {
-    if [[ "${INGRESS_MODE}" == "standalone" ]]; then
-        compose --profile standalone exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
-    fi
+    compose --profile https exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
     local body
     body="$(curl -fsS --connect-timeout 5 --max-time 15 \
-        --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "${PUBLIC_URL}/_up")" || die "公网 HTTPS 验证失败；请检查现有反向代理路由及云安全组。"
+        --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "${PUBLIC_URL}/_up")" || die "公网 HTTPS 验证失败；请确认云安全组已放行 ${HTTPS_PORT}/TCP。"
     grep -q '"status":"ok"' <<< "${body}" || die "HTTPS 已响应，但 CouchDB 健康检查内容不正确。"
     ok "HTTPS、证书与 CouchDB 端到端验证通过。"
 }
@@ -541,8 +485,8 @@ usage() {
 用法：sudo bash install.sh [--non-interactive] [--detect-ip]
 
 环境变量：
-  PUBLIC_IP                 独立模式下明确指定公网 IPv4
-  EXISTING_HTTPS_ORIGIN     现有 Caddy 的入口，如 https://example.com
+  PUBLIC_IP          明确指定公网 IPv4
+  HTTPS_PORT         独立 HTTPS 端口；默认依次选择 443、8443、9443、10443
   COUCHDB_USER       CouchDB 用户名，默认 obsidian_user
   COUCHDB_PASSWORD   CouchDB 密码；不指定则随机生成
   COUCHDB_DATABASE   数据库名，默认 obsidiannotes
@@ -579,24 +523,18 @@ main() {
     detect_system
     install_base_packages
     ensure_docker
-    detect_ingress_mode
+    choose_ip_candidate
+    select_https_port
 
     prepare_files
-    if [[ "${INGRESS_MODE}" == "standalone" ]]; then
-        write_http_caddyfile
-        compose --profile standalone up -d couchdb couchdb-init caddy
-        wait_for_couchdb
-        install_acme
-        install_renewal_helpers
-        issue_certificate
-        write_https_caddyfile
-        compose --profile standalone up -d
-        compose --profile standalone exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
-    else
-        compose up -d couchdb couchdb-init
-        wait_for_couchdb
-        integrate_existing_caddy
-    fi
+    compose up -d couchdb couchdb-init
+    wait_for_couchdb
+    install_acme
+    install_renewal_helpers
+    issue_certificate
+    write_https_caddyfile
+    compose --profile https up -d caddy
+    compose --profile https exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
     write_connection_file
     verify_installation
 

@@ -22,5 +22,6 @@ jobs:
           printf '%s\n' \
             'COUCHDB_USER=test_user' \
             'COUCHDB_PASSWORD=0123456789abcdef0123456789abcdef' \
-            'COUCHDB_DATABASE=obsidiannotes' > .env
+            'COUCHDB_DATABASE=obsidiannotes' \
+            'HTTPS_PORT=8443' > .env
           docker compose config --quiet

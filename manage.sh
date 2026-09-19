@@ -15,12 +15,10 @@ source "${env_file}"
 set +a
 
 compose() {
-    local -a profile_args=()
-    [[ "${INGRESS_MODE:-standalone}" == "standalone" ]] && profile_args=(--profile standalone)
     if docker compose version >/dev/null 2>&1; then
-        docker compose -p zoe-livesync --project-directory "${install_dir}" -f "${install_dir}/compose.yaml" "${profile_args[@]}" "$@"
+        docker compose -p zoe-livesync --project-directory "${install_dir}" -f "${install_dir}/compose.yaml" --profile https "$@"
     else
-        docker-compose -p zoe-livesync --project-directory "${install_dir}" -f "${install_dir}/compose.yaml" "${profile_args[@]}" "$@"
+        docker-compose -p zoe-livesync --project-directory "${install_dir}" -f "${install_dir}/compose.yaml" --profile https "$@"
     fi
 }
 
@@ -29,11 +27,7 @@ case "${1:-status}" in
         compose ps
         echo
         curl -fsS --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "${PUBLIC_URL}/_up" && echo
-        if [[ "${INGRESS_MODE:-standalone}" == "standalone" ]]; then
-            openssl x509 -in "${install_dir}/certs/fullchain.cer" -noout -subject -issuer -dates
-        else
-            echo "入口由现有 Caddy 管理：${PUBLIC_URL}"
-        fi
+        openssl x509 -in "${install_dir}/certs/fullchain.cer" -noout -subject -issuer -dates
         ;;
     logs)
         if [[ -n "${2:-}" ]]; then
@@ -46,11 +40,7 @@ case "${1:-status}" in
         compose restart
         ;;
     renew)
-        if [[ "${INGRESS_MODE:-standalone}" == "standalone" ]]; then
-            /usr/local/sbin/zoe-livesync-renew
-        else
-            echo "当前证书由现有 Caddy 管理，无需 Zoe 单独续期。"
-        fi
+        /usr/local/sbin/zoe-livesync-renew
         ;;
     config)
         cat "${install_dir}/connection.txt"
