@@ -26,8 +26,17 @@ case "${1:-status}" in
     status)
         compose ps
         echo
-        curl -fsS --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "${PUBLIC_URL}/_up" && echo
+        curl --noproxy '*' -fsS --resolve "${PUBLIC_IP}:${HTTPS_PORT}:127.0.0.1" \
+            --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "${PUBLIC_URL}/_up" && echo
+        curl -fsS --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" \
+            "http://127.0.0.1:5984/${COUCHDB_DATABASE}" >/dev/null
         openssl x509 -in "${install_dir}/certs/fullchain.cer" -noout -subject -issuer -dates
+        if [[ -f "${install_dir}/certificate-renewal-failed.txt" ]]; then
+            echo
+            echo "警告：最近一次证书续期失败：" >&2
+            cat "${install_dir}/certificate-renewal-failed.txt" >&2
+            exit 1
+        fi
         ;;
     logs)
         if [[ -n "${2:-}" ]]; then

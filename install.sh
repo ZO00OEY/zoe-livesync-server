@@ -4,7 +4,7 @@ set -euo pipefail
 PROJECT_NAME="Zoe LiveSync Server"
 INSTALL_DIR="${ZOE_INSTALL_DIR:-/opt/zoe-livesync-server}"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ACME_HOME="${ACME_HOME:-/root/.acme.sh}"
+ACME_HOME="${ACME_HOME:-${INSTALL_DIR}/acme}"
 ACME_BIN="${ACME_HOME}/acme.sh"
 NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
 PUBLIC_IP="${PUBLIC_IP:-}"
@@ -288,7 +288,7 @@ port_is_busy() {
 }
 
 select_https_port() {
-    local stored_port="" candidate random_value
+    local stored_port="" candidate random_value requested_port="${HTTPS_PORT}"
     if [[ -f "${INSTALL_DIR}/.env" ]]; then
         stored_port="$(sed -n 's/^HTTPS_PORT=//p' "${INSTALL_DIR}/.env" | head -n 1)"
     fi
@@ -300,10 +300,16 @@ select_https_port() {
         fi
         if port_is_busy "${HTTPS_PORT}"; then
             if ! docker port zoe-livesync-caddy 443/tcp 2>/dev/null | grep -Eq ":${HTTPS_PORT}$"; then
-                die "指定的 HTTPS 端口 ${HTTPS_PORT} 已被其他服务占用。"
+                if [[ -n "${requested_port}" ]]; then
+                    die "明确指定的 HTTPS 端口 ${HTTPS_PORT} 已被其他服务占用，请换一个端口。"
+                fi
+                warn "上次自动选择的 HTTPS 端口 ${HTTPS_PORT} 已被其他服务占用，将重新随机选择。"
+                HTTPS_PORT=""
             fi
         fi
-    else
+    fi
+
+    if [[ -z "${HTTPS_PORT}" ]]; then
         for _ in {1..100}; do
             random_value="$(od -An -N4 -tu4 /dev/urandom | tr -d '[:space:]')"
             candidate=$((20000 + random_value % 10000))
@@ -323,6 +329,13 @@ select_https_port() {
     info "已选定独立随机 HTTPS 端口：${HTTPS_PORT}"
 }
 
+check_local_service_ports() {
+    if port_is_busy 5984 && ! docker port zoe-livesync-couchdb 5984/tcp 2>/dev/null | grep -Eq '127\.0\.0\.1:5984$'; then
+        ss -H -ltnp 'sport = :5984' 2>/dev/null >&2 || true
+        die "本机 127.0.0.1:5984 已被其他服务占用；为避免接管现有 CouchDB，安装已停止。"
+    fi
+}
+
 custom_firewall_is_restrictive() {
     local input_policy=""
 
@@ -337,7 +350,7 @@ custom_firewall_is_restrictive() {
 }
 
 configure_host_firewall() {
-    local port zone
+    local port zone route_interface
 
     case "${FIREWALL_MODE}" in
         auto) ;;
@@ -359,13 +372,19 @@ configure_host_firewall() {
     fi
 
     if command_exists firewall-cmd && firewall-cmd --state 2>/dev/null | grep -qx 'running'; then
-        zone="$(firewall-cmd --get-active-zones 2>/dev/null | awk 'NF && $1 !~ /^(interfaces:|sources:)$/ {print $1; exit}')"
-        [[ -n "${zone}" ]] || zone="$(firewall-cmd --get-default-zone)"
+        route_interface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
+        if [[ -n "${route_interface}" ]]; then
+            zone="$(firewall-cmd --get-zone-of-interface="${route_interface}" 2>/dev/null || true)"
+            [[ "${zone}" == "no zone" ]] && zone=""
+        fi
+        [[ -n "${zone}" ]] || zone="$(firewall-cmd --get-default-zone 2>/dev/null || true)"
+        [[ -n "${zone}" ]] || die "无法确定公网默认路由所属的 firewalld zone，请使用 FIREWALL_MODE=skip 后手动放行。"
+        firewall-cmd --get-zones 2>/dev/null | tr ' ' '\n' | grep -Fxq "${zone}" || die "firewalld zone ${zone} 不存在。"
         for port in 80 "${HTTPS_PORT}"; do
             firewall-cmd --zone="${zone}" --add-port="${port}/tcp" >/dev/null || die "firewalld 临时放行 TCP ${port} 失败。"
             firewall-cmd --permanent --zone="${zone}" --add-port="${port}/tcp" >/dev/null || die "firewalld 永久放行 TCP ${port} 失败。"
         done
-        HOST_FIREWALL_STATUS="firewalld 区域 ${zone} 已自动放行 TCP 80 和 TCP ${HTTPS_PORT}"
+        HOST_FIREWALL_STATUS="firewalld 区域 ${zone}${route_interface:+（公网路由接口 ${route_interface}）} 已自动放行 TCP 80 和 TCP ${HTTPS_PORT}"
         ok "${HOST_FIREWALL_STATUS}。"
         return
     fi
@@ -383,7 +402,7 @@ prepare_files() {
     mkdir -p "${INSTALL_DIR}"/{config,scripts,certs}
     install -m 0644 "${SOURCE_DIR}/compose.yaml" "${INSTALL_DIR}/compose.yaml"
     install -m 0644 "${SOURCE_DIR}/config/livesync.ini" "${INSTALL_DIR}/config/livesync.ini"
-    install -m 0755 "${SOURCE_DIR}/scripts/couchdb-init.sh" "${INSTALL_DIR}/scripts/couchdb-init.sh"
+    install -m 0644 "${SOURCE_DIR}/scripts/provision-couchdb.ts" "${INSTALL_DIR}/scripts/provision-couchdb.ts"
     install -m 0755 "${SOURCE_DIR}/scripts/generate-setup-uri.sh" "${INSTALL_DIR}/scripts/generate-setup-uri.sh"
     install -m 0644 "${SOURCE_DIR}/scripts/create-setup-uri.ts" "${INSTALL_DIR}/scripts/create-setup-uri.ts"
     install -m 0755 "${SOURCE_DIR}/manage.sh" "${INSTALL_DIR}/manage.sh"
@@ -434,16 +453,24 @@ EOF
 
 install_acme() {
     if [[ -x "${ACME_BIN}" ]]; then
-        ok "acme.sh 已安装。"
-        return
+        if "${ACME_BIN}" --help 2>&1 | grep -q -- '--certificate-profile'; then
+            ok "本项目隔离的 acme.sh 已安装。"
+            return
+        fi
+        warn "现有项目内 acme.sh 不支持证书 profile，将更新项目副本。"
     fi
-    info "安装 acme.sh。"
+    info "安装本项目隔离的 acme.sh（不修改服务器已有的 acme.sh 任务）。"
+    local installer
+    installer="$(mktemp)"
+    curl -fsSL https://get.acme.sh -o "${installer}" || { rm -f "${installer}"; die "下载 acme.sh 安装器失败。"; }
+    local -a install_args=(--install --home "${ACME_HOME}" --config-home "${ACME_HOME}" --nocron --noprofile)
     if [[ -n "${ACME_EMAIL:-}" ]]; then
-        curl -fsSL https://get.acme.sh | HOME=/root sh -s email="${ACME_EMAIL}" >/dev/null
-    else
-        curl -fsSL https://get.acme.sh | HOME=/root sh >/dev/null
+        install_args+=(--accountemail "${ACME_EMAIL}")
     fi
+    sh "${installer}" "${install_args[@]}" >/dev/null || { rm -f "${installer}"; die "acme.sh 安装失败。"; }
+    rm -f "${installer}"
     [[ -x "${ACME_BIN}" ]] || die "acme.sh 安装失败。"
+    "${ACME_BIN}" --help 2>&1 | grep -q -- '--certificate-profile' || die "acme.sh 版本不支持 IP 短期证书 profile。"
 }
 
 issue_certificate() {
@@ -461,9 +488,9 @@ issue_certificate() {
         ss -H -ltnp 'sport = :80' 2>/dev/null >&2 || true
         die "申请公网 IP 证书需要临时使用 80 端口，但该端口当前被占用；脚本不会停止现有服务。"
     fi
-    "${ACME_BIN}" --issue --server letsencrypt -d "${PUBLIC_IP}" \
-        --certificate-profile shortlived --standalone --listen-v4 --ecc --force
-    "${ACME_BIN}" --install-cert -d "${PUBLIC_IP}" --ecc \
+    "${ACME_BIN}" --issue --home "${ACME_HOME}" --server letsencrypt -d "${PUBLIC_IP}" \
+        --certificate-profile shortlived --days -1 --standalone --listen-v4 --ecc --force
+    "${ACME_BIN}" --install-cert --home "${ACME_HOME}" -d "${PUBLIC_IP}" --ecc \
         --fullchain-file "${cert_file}" --key-file "${key_file}" \
         --reloadcmd "/usr/local/sbin/zoe-livesync-reload"
 
@@ -490,19 +517,14 @@ fi
 EOF
     cat > /usr/local/sbin/zoe-livesync-renew <<EOF
 #!/usr/bin/env bash
-set -eu
-if ss -H -ltn 'sport = :80' 2>/dev/null | grep -q .; then
-    echo "80 端口正在使用，跳过本轮 IP 证书续期；未停止任何现有服务"
-    exit 1
-fi
+set -euo pipefail
+failure_file="${INSTALL_DIR}/certificate-renewal-failed.txt"
+trap 'printf "续期失败时间: %s\\n请运行: /usr/local/sbin/zoe-livesync-renew\\n" "\$(date -Is)" > "${INSTALL_DIR}/certificate-renewal-failed.txt"' ERR
 "${ACME_BIN}" --cron --home "${ACME_HOME}"
 openssl x509 -checkend 86400 -noout -in "${INSTALL_DIR}/certs/fullchain.cer"
+rm -f "\${failure_file}"
 EOF
     chmod 0755 /usr/local/sbin/zoe-livesync-reload /usr/local/sbin/zoe-livesync-renew
-    local current_cron
-    current_cron="$(crontab -l 2>/dev/null || true)"
-    printf '%s\n' "${current_cron}" | awk '!(index($0, "acme.sh") && index($0, "--cron"))' | \
-        sed '/^[[:space:]]*$/d' | crontab -
     cat > /etc/cron.d/zoe-livesync-renew <<'EOF'
 17 */12 * * * root /usr/local/sbin/zoe-livesync-renew >> /var/log/zoe-livesync-renew.log 2>&1
 EOF
@@ -524,6 +546,29 @@ wait_for_couchdb() {
     done
     compose logs --tail=100 couchdb couchdb-init >&2 || true
     die "CouchDB 在规定时间内未就绪。"
+}
+
+provision_couchdb() {
+    info "配置 CouchDB，并初始化 LiveSync 数据库版本。"
+    if ! compose run --rm --no-deps couchdb-init; then
+        compose logs --tail=150 couchdb >&2 || true
+        die "CouchDB 初始化失败；未继续签发证书或显示成功信息。"
+    fi
+    ok "CouchDB 初始化和 LiveSync 数据库版本验证通过。"
+}
+
+verify_couchdb_configuration() {
+    local base="http://127.0.0.1:5984" body setting
+    body="$(curl -fsS --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "${base}/${COUCHDB_DATABASE}")" || \
+        die "CouchDB 数据库 ${COUCHDB_DATABASE} 不存在或无法读取。"
+    grep -Fq '"db_name":"'"${COUCHDB_DATABASE}"'"' <<< "${body}" || die "CouchDB 数据库响应不正确。"
+    setting="$(curl -fsS --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" \
+        "${base}/_node/_local/_config/chttpd/require_valid_user")" || die "无法读取 CouchDB 认证配置。"
+    [[ "${setting}" == '"true"' ]] || die "CouchDB require_valid_user 未正确启用。"
+    setting="$(curl -fsS --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" \
+        "${base}/_node/_local/_config/cors/origins")" || die "无法读取 CouchDB CORS 配置。"
+    grep -Fq 'app://obsidian.md' <<< "${setting}" || die "CouchDB CORS 配置缺少 Obsidian 来源。"
+    ok "数据库存在，认证和 CORS 配置验证通过。"
 }
 
 write_connection_file() {
@@ -550,10 +595,18 @@ EOF
 verify_installation() {
     compose --profile https exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
     local body
-    body="$(curl -fsS --connect-timeout 5 --max-time 15 \
-        --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "${PUBLIC_URL}/_up")" || die "公网 HTTPS 验证失败；请确认云安全组已放行 ${HTTPS_PORT}/TCP。"
+    body="$(curl --noproxy '*' -fsS --connect-timeout 5 --max-time 15 \
+        --resolve "${PUBLIC_IP}:${HTTPS_PORT}:127.0.0.1" \
+        --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "${PUBLIC_URL}/_up")" || die "本机 HTTPS、证书或 Caddy 验证失败。"
     grep -q '"status":"ok"' <<< "${body}" || die "HTTPS 已响应，但 CouchDB 健康检查内容不正确。"
-    ok "HTTPS、证书与 CouchDB 端到端验证通过。"
+    ok "本机 HTTPS、证书、Caddy 与 CouchDB 端到端验证通过。"
+
+    if curl --noproxy '*' -fsS --connect-timeout 5 --max-time 15 \
+        --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "${PUBLIC_URL}/_up" 2>/dev/null | grep -q '"status":"ok"'; then
+        ok "服务器经公网 IP 回环访问验证通过。"
+    else
+        warn "服务器无法经自己的公网 IP 回环访问；这不一定代表外部不可用，请从手机网络访问 ${PUBLIC_URL}/_up 验证云安全组。"
+    fi
 }
 
 usage() {
@@ -610,11 +663,14 @@ main() {
     ensure_docker
     choose_ip_candidate
     select_https_port
+    check_local_service_ports
     configure_host_firewall
 
     prepare_files
-    compose up -d couchdb couchdb-init
+    compose up -d couchdb
     wait_for_couchdb
+    provision_couchdb
+    verify_couchdb_configuration
     install_acme
     install_renewal_helpers
     issue_certificate

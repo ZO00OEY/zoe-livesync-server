@@ -12,7 +12,11 @@ services:
     ports:
       - "127.0.0.1:5984:5984"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf -u $${COUCHDB_USER}:$${COUCHDB_PASSWORD} http://localhost:5984/_session | grep -q ok"]
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf -u $${COUCHDB_USER}:$${COUCHDB_PASSWORD} http://localhost:5984/_session | grep -q ok",
+        ]
       interval: 5s
       timeout: 5s
       retries: 24
@@ -21,20 +25,23 @@ services:
       - livesync
 
   couchdb-init:
-    image: curlimages/curl:8.16.0
+    image: denoland/deno:alpine-2.9.7
     container_name: zoe-livesync-init
     restart: "no"
     depends_on:
       couchdb:
         condition: service_healthy
     environment:
-      COUCHDB_INTERNAL_URL: http://couchdb:5984
-      COUCHDB_USER: ${COUCHDB_USER}
-      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD}
-      COUCHDB_DATABASE: ${COUCHDB_DATABASE:-obsidiannotes}
+      hostname: http://couchdb:5984
+      username: ${COUCHDB_USER}
+      password: ${COUCHDB_PASSWORD}
+      database: ${COUCHDB_DATABASE:-obsidiannotes}
+      retry_count: 12
+      retry_delay_ms: 5000
     volumes:
-      - ./scripts/couchdb-init.sh:/couchdb-init.sh:ro
-    entrypoint: ["sh", "/couchdb-init.sh"]
+      - ./scripts/provision-couchdb.ts:/provision-couchdb.ts:ro
+    entrypoint:
+      ["deno", "run", "--allow-env", "--allow-net", "/provision-couchdb.ts"]
     networks:
       - livesync
 

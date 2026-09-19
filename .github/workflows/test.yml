@@ -25,6 +25,19 @@ jobs:
             'COUCHDB_DATABASE=obsidiannotes' \
             'HTTPS_PORT=8443' > .env
           docker compose config --quiet
+      - name: Provision CouchDB twice and verify LiveSync configuration
+        run: |
+          cleanup() { docker compose down -v --remove-orphans; }
+          trap cleanup EXIT
+          docker compose up -d couchdb
+          docker compose run --rm --no-deps couchdb-init
+          docker compose run --rm --no-deps couchdb-init
+          curl -fsS --user test_user:0123456789abcdef0123456789abcdef \
+            http://127.0.0.1:5984/obsidiannotes | grep -Fq '"db_name":"obsidiannotes"'
+          test "$(curl -fsS --user test_user:0123456789abcdef0123456789abcdef \
+            http://127.0.0.1:5984/_node/_local/_config/chttpd/require_valid_user)" = '"true"'
+          curl -fsS --user test_user:0123456789abcdef0123456789abcdef \
+            http://127.0.0.1:5984/_node/_local/_config/cors/origins | grep -Fq 'app://obsidian.md'
       - name: Generate a Self-hosted LiveSync setup URI
         run: |
           test_dir="$(mktemp -d)"

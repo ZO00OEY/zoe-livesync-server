@@ -5,7 +5,6 @@ root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 bash -n "${root_dir}/install.sh"
 bash -n "${root_dir}/manage.sh"
-sh -n "${root_dir}/scripts/couchdb-init.sh"
 bash -n "${root_dir}/scripts/generate-setup-uri.sh"
 
 # shellcheck disable=SC1091
@@ -37,6 +36,21 @@ select_https_port >/dev/null
     echo "Unexpected public URL: ${PUBLIC_URL}" >&2
     exit 1
 }
+
+# A port restored from an earlier automatic install must be replaced when it
+# has since been claimed by an unrelated process.
+port_test_dir="$(mktemp -d)"
+printf '%s\n' 'HTTPS_PORT=24567' > "${port_test_dir}/.env"
+INSTALL_DIR="${port_test_dir}"
+HTTPS_PORT=""
+port_is_busy() { [[ "$1" == "24567" ]]; }
+docker() { return 1; }
+select_https_port >/dev/null 2>&1
+[[ "${HTTPS_PORT}" != "24567" && "${HTTPS_PORT}" -ge 20000 && "${HTTPS_PORT}" -le 29999 ]] || {
+    echo "Occupied stored port was not replaced: ${HTTPS_PORT}" >&2
+    exit 1
+}
+rm -rf "${port_test_dir}"
 
 export FIREWALL_MODE="skip"
 configure_host_firewall >/dev/null 2>&1
