@@ -474,9 +474,12 @@ write_connection_file() {
 API 类型: CouchDB
 API URL: ${PUBLIC_URL}
 HTTPS 端口: ${HTTPS_PORT}
+认证方式: HTTP Basic Auth（没有单独的 API Key）
 用户名: ${COUCHDB_USER}
 密码: ${COUCHDB_PASSWORD}
 数据库: ${COUCHDB_DATABASE}
+
+服务器提醒: 请在云服务商安全组中放行 TCP ${HTTPS_PORT} 端口。
 
 注意：首次设备请使用一个单独保存的端到端加密口令；它不是上面的 CouchDB 密码。
 EOF
