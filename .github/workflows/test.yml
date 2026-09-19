@@ -44,3 +44,7 @@ jobs:
           [[ "$(wc -l < "${test_dir}/setup-uri-only.txt")" -eq 1 ]]
           grep -Fq "${uri}" "${test_dir}/setup-uri.txt"
           grep -Fq 'Setup URI 保护口令: 22222222222222222222222222222222' "${test_dir}/setup-uri.txt"
+          grep -Fq '当前值: 开启，每 60 秒一次' "${test_dir}/setup-uri.txt"
+          grep -Fq '持续实时连接 LiveSync: 关闭' "${test_dir}/setup-uri.txt"
+          grep -Fq '只复制下一行完整内容' "${test_dir}/setup-uri.txt"
+          grep -Fq '完整复制到上一行结束' "${test_dir}/setup-uri.txt"

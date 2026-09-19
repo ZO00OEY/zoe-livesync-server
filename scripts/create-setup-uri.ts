@@ -30,12 +30,22 @@ const expected: ReadonlyArray<[keyof typeof decoded, string | boolean]> = [
   ["passphrase", environment.passphrase ?? ""],
   ["isConfigured", true],
   ["encrypt", true],
+  ["usePathObfuscation", true],
+  ["periodicReplication", true],
+  ["syncOnStart", true],
+  ["syncOnFileOpen", true],
+  ["syncAfterMerge", true],
+  ["batchSave", true],
 ];
 
 for (const [key, value] of expected) {
   if (decoded[key] !== value) {
     throw new Error(`Setup URI round-trip mismatch: ${String(key)}`);
   }
+}
+
+if (generated.remoteType !== "couchdb") {
+  throw new Error("Setup URI remote type is not CouchDB");
 }
 
 console.log(setupURI);
