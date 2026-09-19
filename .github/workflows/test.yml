@@ -1,0 +1,26 @@
+name: Test installer
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@2.0.0
+      - name: Unit tests
+        run: bash scripts/self-test.sh
+      - name: Validate Compose model
+        run: |
+          cp /dev/null .env
+          printf '%s\n' \
+            'COUCHDB_USER=test_user' \
+            'COUCHDB_PASSWORD=0123456789abcdef0123456789abcdef' \
+            'COUCHDB_DATABASE=obsidiannotes' > .env
+          docker compose config --quiet
