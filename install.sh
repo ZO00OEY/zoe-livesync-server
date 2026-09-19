@@ -77,7 +77,6 @@ collect_ip_candidates() {
 
     add_ip_candidate "ipify（直连）" "$(direct_curl https://api.ipify.org || true)"
     add_ip_candidate "AWS checkip（直连）" "$(direct_curl https://checkip.amazonaws.com || true)"
-    add_ip_candidate "icanhazip（直连）" "$(direct_curl https://ipv4.icanhazip.com || true)"
     add_ip_candidate "Cloudflare trace（直连）" "$(direct_curl https://1.1.1.1/cdn-cgi/trace | awk -F= '$1=="ip" {print $2}' || true)"
 
     token="$(curl --noproxy '*' -fsS -X PUT --connect-timeout 1 --max-time 2 \
@@ -480,19 +479,18 @@ issue_certificate() {
     if [[ -f "${cert_file}" ]] && openssl x509 -checkend 86400 -noout -in "${cert_file}" >/dev/null 2>&1 && \
        openssl x509 -in "${cert_file}" -noout -text | grep -Fq "IP Address:${PUBLIC_IP}"; then
         ok "现有 IP 证书仍有效，跳过首次签发。"
-        return
+    else
+        info "向 Let's Encrypt 申请短期公网 IP 证书。"
+        if port_is_busy 80; then
+            ss -H -ltnp 'sport = :80' 2>/dev/null >&2 || true
+            die "申请公网 IP 证书需要临时使用 80 端口，但该端口当前被占用；脚本不会停止现有服务。"
+        fi
+        "${ACME_BIN}" --issue --home "${ACME_HOME}" --server letsencrypt -d "${PUBLIC_IP}" \
+            --certificate-profile shortlived --days -1 --standalone --listen-v4 --ecc --force
     fi
-
-    info "向 Let's Encrypt 申请短期公网 IP 证书。"
-    if port_is_busy 80; then
-        ss -H -ltnp 'sport = :80' 2>/dev/null >&2 || true
-        die "申请公网 IP 证书需要临时使用 80 端口，但该端口当前被占用；脚本不会停止现有服务。"
-    fi
-    "${ACME_BIN}" --issue --home "${ACME_HOME}" --server letsencrypt -d "${PUBLIC_IP}" \
-        --certificate-profile shortlived --days -1 --standalone --listen-v4 --ecc --force
     "${ACME_BIN}" --install-cert --home "${ACME_HOME}" -d "${PUBLIC_IP}" --ecc \
         --fullchain-file "${cert_file}" --key-file "${key_file}" \
-        --reloadcmd "/usr/local/sbin/zoe-livesync-reload"
+        --reloadcmd "${INSTALL_DIR}/manage.sh reload-caddy"
 
     openssl x509 -checkend 86400 -noout -in "${cert_file}" >/dev/null 2>&1 || die "签发结果不是有效证书。"
     openssl x509 -in "${cert_file}" -noout -text | grep -Fq "IP Address:${PUBLIC_IP}" || die "证书 SAN 与公网 IP 不匹配。"
@@ -500,33 +498,9 @@ issue_certificate() {
     chmod 0600 "${key_file}"
 }
 
-install_renewal_helpers() {
-    cat > /usr/local/sbin/zoe-livesync-reload <<EOF
-#!/usr/bin/env bash
-set -eu
-cd "${INSTALL_DIR}"
-if docker compose version >/dev/null 2>&1; then
-    if docker ps --format '{{.Names}}' | grep -qx zoe-livesync-caddy; then
-        docker compose -p zoe-livesync --profile https exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
-    fi
-else
-    if docker ps --format '{{.Names}}' | grep -qx zoe-livesync-caddy; then
-        docker-compose -p zoe-livesync --profile https exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
-    fi
-fi
-EOF
-    cat > /usr/local/sbin/zoe-livesync-renew <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-failure_file="${INSTALL_DIR}/certificate-renewal-failed.txt"
-trap 'printf "续期失败时间: %s\\n请运行: /usr/local/sbin/zoe-livesync-renew\\n" "\$(date -Is)" > "${INSTALL_DIR}/certificate-renewal-failed.txt"' ERR
-"${ACME_BIN}" --cron --home "${ACME_HOME}"
-openssl x509 -checkend 86400 -noout -in "${INSTALL_DIR}/certs/fullchain.cer"
-rm -f "\${failure_file}"
-EOF
-    chmod 0755 /usr/local/sbin/zoe-livesync-reload /usr/local/sbin/zoe-livesync-renew
-    cat > /etc/cron.d/zoe-livesync-renew <<'EOF'
-17 */12 * * * root /usr/local/sbin/zoe-livesync-renew >> /var/log/zoe-livesync-renew.log 2>&1
+install_renewal_schedule() {
+    cat > /etc/cron.d/zoe-livesync-renew <<EOF
+17 */12 * * * root "${INSTALL_DIR}/manage.sh" renew >> /var/log/zoe-livesync-renew.log 2>&1
 EOF
     chmod 0644 /etc/cron.d/zoe-livesync-renew
     command_exists systemctl && systemctl enable --now cron >/dev/null 2>&1 || \
@@ -593,7 +567,7 @@ EOF
 }
 
 verify_installation() {
-    compose --profile https exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+    compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
     local body
     body="$(curl --noproxy '*' -fsS --connect-timeout 5 --max-time 15 \
         --resolve "${PUBLIC_IP}:${HTTPS_PORT}:127.0.0.1" \
@@ -672,11 +646,10 @@ main() {
     provision_couchdb
     verify_couchdb_configuration
     install_acme
-    install_renewal_helpers
     issue_certificate
+    install_renewal_schedule
     write_https_caddyfile
-    compose --profile https up -d caddy
-    compose --profile https exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+    compose up -d caddy
     write_connection_file
     verify_installation
     "${INSTALL_DIR}/scripts/generate-setup-uri.sh" >/dev/null

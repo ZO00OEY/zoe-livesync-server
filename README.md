@@ -20,7 +20,7 @@
 - 不停止、不改写、不接管服务器上已有的代理节点。
 - 使用项目独立的 acme.sh 目录，每 12 小时只检查本项目 IP 证书；不删除、改写或调用服务器已有的 acme.sh 证书任务。证书更新后自动重载本项目自己的 Caddy。
 - CouchDB 仅绑定 `127.0.0.1:5984`，不会把数据库原始端口暴露到公网。
-- 自动配置 Self-hosted LiveSync 所需的 CORS、认证和大小限制，并使用固定版本的 LiveSync Commonlib 初始化、验证数据库版本。
+- 直接调用固定提交的 Self-hosted LiveSync 上游 provisioning，配置 CORS、认证和大小限制，并初始化、验证数据库版本。
 - CouchDB 初始化同步等待并检查退出状态；初始化失败时不会继续显示安装成功。
 - 生成可直接填写到 Self-hosted LiveSync 的连接信息。
 
@@ -161,4 +161,4 @@ Obsidian LiveSync → https://服务器IP:随机端口
 
 - CouchDB：`3.5.2.1`
 - Caddy：`2.11.4-alpine`
-- CouchDB 初始化逻辑依据第三方社区插件 Self-hosted LiveSync 的上游仓库提交 `2c2b9c90e4e10a454f2838c63ba656c0e67a374c` 重写，LiveSync Commonlib 固定为 `0.1.0-rc.4`。这里的“上游”不代表 Obsidian 官方服务或 Obsidian Sync。
+- CouchDB 初始化直接调用第三方社区插件 Self-hosted LiveSync 的上游仓库提交 `2c2b9c90e4e10a454f2838c63ba656c0e67a374c`。这里的“上游”不代表 Obsidian 官方服务或 Obsidian Sync。

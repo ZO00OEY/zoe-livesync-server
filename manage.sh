@@ -3,6 +3,8 @@ set -euo pipefail
 
 install_dir="${ZOE_INSTALL_DIR:-/opt/zoe-livesync-server}"
 env_file="${install_dir}/.env"
+acme_home="${ACME_HOME:-${install_dir}/acme}"
+failure_file="${install_dir}/certificate-renewal-failed.txt"
 
 if [[ ! -f "${env_file}" ]]; then
     echo "未找到 ${env_file}，请先运行 install.sh。" >&2
@@ -16,9 +18,9 @@ set +a
 
 compose() {
     if docker compose version >/dev/null 2>&1; then
-        docker compose -p zoe-livesync --project-directory "${install_dir}" -f "${install_dir}/compose.yaml" --profile https "$@"
+        docker compose -p zoe-livesync --project-directory "${install_dir}" -f "${install_dir}/compose.yaml" "$@"
     else
-        docker-compose -p zoe-livesync --project-directory "${install_dir}" -f "${install_dir}/compose.yaml" --profile https "$@"
+        docker-compose -p zoe-livesync --project-directory "${install_dir}" -f "${install_dir}/compose.yaml" "$@"
     fi
 }
 
@@ -49,7 +51,15 @@ case "${1:-status}" in
         compose restart
         ;;
     renew)
-        /usr/local/sbin/zoe-livesync-renew
+        trap 'printf "续期失败时间: %s\n请重试: %s renew\n" "$(date -Is)" "$0" > "${failure_file}"' ERR
+        "${acme_home}/acme.sh" --cron --home "${acme_home}"
+        openssl x509 -checkend 86400 -noout -in "${install_dir}/certs/fullchain.cer"
+        rm -f "${failure_file}"
+        ;;
+    reload-caddy)
+        if docker ps --format '{{.Names}}' | grep -qx zoe-livesync-caddy; then
+            compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+        fi
         ;;
     config)
         cat "${install_dir}/connection.txt"

@@ -48,7 +48,6 @@ services:
   caddy:
     image: caddy:2.11.4-alpine
     container_name: zoe-livesync-caddy
-    profiles: [https]
     restart: unless-stopped
     depends_on:
       couchdb:
@@ -58,15 +57,11 @@ services:
     volumes:
       - ./config/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./certs:/certs:ro
-      - caddy-data:/data
-      - caddy-config:/config
     networks:
       - livesync
 
 volumes:
   couchdb-data:
-  caddy-data:
-  caddy-config:
 
 networks:
   livesync:
