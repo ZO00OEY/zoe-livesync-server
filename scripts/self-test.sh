@@ -38,7 +38,7 @@ select_https_port >/dev/null
     exit 1
 }
 
-FIREWALL_MODE="skip"
+export FIREWALL_MODE="skip"
 configure_host_firewall >/dev/null 2>&1
 [[ "${HOST_FIREWALL_STATUS}" == *"FIREWALL_MODE=skip"* ]] || {
     echo "Unexpected firewall status: ${HOST_FIREWALL_STATUS}" >&2
