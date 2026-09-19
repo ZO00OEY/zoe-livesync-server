@@ -31,20 +31,38 @@ certificate_matches_key() {
     [[ -n "${cert_hash}" && "${cert_hash}" == "${key_hash}" ]]
 }
 
+certificate_covers_host() {
+    if [[ "${PUBLIC_HOST}" == "${PUBLIC_IP}" ]]; then
+        openssl x509 -checkip "${PUBLIC_HOST}" -noout -in "$1" >/dev/null
+    else
+        openssl x509 -checkhost "${PUBLIC_HOST}" -noout -in "$1" >/dev/null
+    fi
+}
+
 sync_existing_certificate() {
+    local staging
     [[ -r "${TLS_CERT_FILE}" && -r "${TLS_KEY_FILE}" ]]
     openssl x509 -checkend 86400 -noout -in "${TLS_CERT_FILE}"
-    if [[ "${PUBLIC_HOST}" == "${PUBLIC_IP}" ]]; then
-        openssl x509 -checkip "${PUBLIC_HOST}" -noout -in "${TLS_CERT_FILE}" >/dev/null
-    else
-        openssl x509 -checkhost "${PUBLIC_HOST}" -noout -in "${TLS_CERT_FILE}" >/dev/null
-    fi
+    certificate_covers_host "${TLS_CERT_FILE}"
     certificate_matches_key "${TLS_CERT_FILE}" "${TLS_KEY_FILE}"
-    if ! cmp -s "${TLS_CERT_FILE}" "${install_dir}/certs/fullchain.cer" || \
-       ! cmp -s "${TLS_KEY_FILE}" "${install_dir}/certs/tls.key"; then
-        install -m 0644 "${TLS_CERT_FILE}" "${install_dir}/certs/fullchain.cer"
-        install -m 0600 "${TLS_KEY_FILE}" "${install_dir}/certs/tls.key"
+    staging="$(mktemp -d "${install_dir}/certs/.incoming.XXXXXX")"
+    if ! install -m 0644 "${TLS_CERT_FILE}" "${staging}/fullchain.cer" || \
+       ! install -m 0600 "${TLS_KEY_FILE}" "${staging}/tls.key" || \
+       ! openssl x509 -checkend 86400 -noout -in "${staging}/fullchain.cer" >/dev/null || \
+       ! certificate_covers_host "${staging}/fullchain.cer" || \
+       ! certificate_matches_key "${staging}/fullchain.cer" "${staging}/tls.key"; then
+        rm -rf "${staging}"
+        echo "复制现有证书时源文件发生变化或副本校验失败；未替换本项目证书。" >&2
+        return 1
+    fi
+    if ! cmp -s "${staging}/fullchain.cer" "${install_dir}/certs/fullchain.cer" || \
+       ! cmp -s "${staging}/tls.key" "${install_dir}/certs/tls.key"; then
+        install -m 0644 "${staging}/fullchain.cer" "${install_dir}/certs/fullchain.cer"
+        install -m 0600 "${staging}/tls.key" "${install_dir}/certs/tls.key"
+        rm -rf "${staging}"
         "$0" reload-caddy
+    else
+        rm -rf "${staging}"
     fi
 }
 

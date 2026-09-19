@@ -73,6 +73,30 @@ select_https_port >/dev/null 2>&1
 }
 rm -rf "${port_test_dir}"
 
+stored_mode_dir="$(mktemp -d)"
+cat > "${stored_mode_dir}/.env" <<'EOF'
+TLS_MODE=ip
+PUBLIC_HOST=8.8.8.8
+TLS_CERT_FILE=
+TLS_KEY_FILE=
+EOF
+INSTALL_DIR="${stored_mode_dir}"
+PUBLIC_IP="8.8.8.8"
+HTTPS_PORT="24443"
+TLS_MODE="auto"
+PUBLIC_HOST=""
+TLS_CERT_FILE=""
+TLS_KEY_FILE=""
+# A rerun keeps its confirmed IP-certificate mode even if port 80 is now busy.
+# shellcheck disable=SC2329
+port_is_busy() { [[ "$1" == "80" ]]; }
+select_tls_mode >/dev/null
+[[ "${TLS_MODE}" == "ip" && "${PUBLIC_HOST}" == "8.8.8.8" ]] || {
+    echo "Stored IP certificate mode was not restored" >&2
+    exit 1
+}
+rm -rf "${stored_mode_dir}"
+
 export FIREWALL_MODE="skip"
 configure_host_firewall >/dev/null 2>&1
 [[ "${HOST_FIREWALL_STATUS}" == *"FIREWALL_MODE=skip"* ]] || {

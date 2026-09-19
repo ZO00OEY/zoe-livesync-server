@@ -212,7 +212,7 @@ detect_system() {
 
 base_tools_ready() {
     local tool
-    for tool in curl openssl ip ss socat; do
+    for tool in curl openssl ip ss socat timeout; do
         command_exists "${tool}" || return 1
     done
     command_exists cron || command_exists crond || return 1
@@ -228,17 +228,17 @@ install_base_packages() {
     fi
     if command_exists apt-get; then
         apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates openssl iproute2 cron gnupg socat
+        DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates openssl iproute2 cron gnupg socat coreutils
     elif command_exists dnf; then
-        dnf install -y curl ca-certificates openssl iproute cronie socat
+        dnf install -y curl ca-certificates openssl iproute cronie socat coreutils
     elif command_exists yum; then
-        yum install -y curl ca-certificates openssl iproute cronie socat
+        yum install -y curl ca-certificates openssl iproute cronie socat coreutils
     elif command_exists zypper; then
-        zypper --non-interactive install curl ca-certificates openssl iproute2 cron socat
+        zypper --non-interactive install curl ca-certificates openssl iproute2 cron socat coreutils
     elif command_exists pacman; then
-        pacman -Sy --noconfirm curl ca-certificates openssl iproute2 cronie socat
+        pacman -Sy --noconfirm curl ca-certificates openssl iproute2 cronie socat coreutils
     elif command_exists apk; then
-        apk add --no-cache bash curl ca-certificates openssl iproute2 socat dcron docker docker-cli-compose
+        apk add --no-cache bash curl ca-certificates openssl iproute2 socat dcron coreutils docker docker-cli-compose
     else
         die "未识别包管理器，请先安装 curl、openssl、iproute2、cron、Docker 和 Compose。"
     fi
@@ -415,25 +415,21 @@ hostname_points_here() {
     getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | grep -Fxq "${PUBLIC_IP}"
 }
 
-discover_existing_certificate() {
-    local peer_cert peer_hash file file_hash identity key root container_id source destination sni_host
-    local -a roots=() cert_files=() key_files=()
-    peer_cert="$(mktemp)"
-    sni_host="$(hostname -f 2>/dev/null || true)"
-    if valid_hostname "${sni_host}"; then
-        openssl s_client -connect 127.0.0.1:443 -servername "${sni_host}" -showcerts </dev/null 2>/dev/null | \
-            awk '/-----BEGIN CERTIFICATE-----/{copy=1} copy{print} /-----END CERTIFICATE-----/{exit}' > "${peer_cert}" || true
-    else
-        openssl s_client -connect 127.0.0.1:443 -showcerts </dev/null 2>/dev/null | \
-            awk '/-----BEGIN CERTIFICATE-----/{copy=1} copy{print} /-----END CERTIFICATE-----/{exit}' > "${peer_cert}" || true
-    fi
-    if ! openssl x509 -in "${peer_cert}" -noout >/dev/null 2>&1; then
-        rm -f "${peer_cert}"
-        return 1
-    fi
-    peer_hash="$(openssl x509 -in "${peer_cert}" -outform DER | sha256sum | awk '{print $1}')"
+served_certificate_hash() {
+    local host="$1"
+    local -a args=(-connect 127.0.0.1:443 -showcerts)
+    valid_ipv4 "${host}" || args+=(-servername "${host}")
+    timeout 8 openssl s_client "${args[@]}" </dev/null 2>/dev/null | \
+        awk '/-----BEGIN CERTIFICATE-----/{copy=1} copy{print} /-----END CERTIFICATE-----/{exit}' | \
+        openssl x509 -outform DER 2>/dev/null | sha256sum | awk '{print $1}' || true
+}
 
-    for root in /etc/letsencrypt /var/lib/caddy /root/.local/share/caddy /etc/headscale /var/lib/headscale; do
+discover_existing_certificate() {
+    local desired_host="${1:-}" peer_hash file file_hash identity key root container_id source destination
+    local -a roots=() cert_files=() key_files=()
+    declare -A served_hashes=()
+
+    for root in /etc/letsencrypt/live /etc/letsencrypt /var/lib/caddy /root/.local/share/caddy /etc/headscale /var/lib/headscale; do
         [[ -d "${root}" ]] && roots+=("${root}")
     done
     while read -r container_id; do
@@ -458,27 +454,34 @@ discover_existing_certificate() {
     done
 
     for file in "${cert_files[@]}"; do
+        [[ "${file}" =~ ^/[A-Za-z0-9._/+:-]+$ ]] || continue
+        openssl x509 -checkend 86400 -noout -in "${file}" >/dev/null 2>&1 || continue
         file_hash="$(openssl x509 -in "${file}" -outform DER 2>/dev/null | sha256sum | awk '{print $1}' || true)"
-        [[ "${file_hash}" == "${peer_hash}" ]] || continue
+        [[ -n "${file_hash}" ]] || continue
         while read -r identity; do
             PUBLIC_HOST="${identity#DNS:}"
             PUBLIC_HOST="${PUBLIC_HOST#IP Address:}"
             [[ "${PUBLIC_HOST}" == \** ]] && continue
+            [[ -z "${desired_host}" || "${PUBLIC_HOST}" == "${desired_host}" ]] || continue
             public_host_points_here || continue
             certificate_covers_public_host "${file}" || continue
+            if [[ -z "${served_hashes["${PUBLIC_HOST}"]+x}" ]]; then
+                served_hashes["${PUBLIC_HOST}"]="$(served_certificate_hash "${PUBLIC_HOST}")"
+            fi
+            peer_hash="${served_hashes["${PUBLIC_HOST}"]}"
+            [[ -n "${peer_hash}" && "${file_hash}" == "${peer_hash}" ]] || continue
             curl --noproxy '*' --resolve "${PUBLIC_HOST}:443:127.0.0.1" -sS --connect-timeout 5 --max-time 10 \
                 -o /dev/null "https://${PUBLIC_HOST}/" 2>/dev/null || continue
             for key in "${key_files[@]}"; do
+                [[ "${key}" =~ ^/[A-Za-z0-9._/+:-]+$ ]] || continue
                 if certificate_matches_key "${file}" "${key}"; then
                     TLS_CERT_FILE="${file}"
                     TLS_KEY_FILE="${key}"
-                    rm -f "${peer_cert}"
                     return 0
                 fi
             done
         done < <(openssl x509 -in "${file}" -noout -ext subjectAltName 2>/dev/null | grep -oE 'DNS:[^, ]+|IP Address:[^, ]+' || true)
     done
-    rm -f "${peer_cert}"
     return 1
 }
 
@@ -492,6 +495,15 @@ select_tls_mode() {
     fi
     if [[ "${TLS_MODE}" == "auto" && "${stored_mode}" == "existing" && -n "${stored_host}" ]]; then
         TLS_MODE="existing"; PUBLIC_HOST="${stored_host}"; TLS_CERT_FILE="${stored_cert}"; TLS_KEY_FILE="${stored_key}"
+        if port_is_busy 443; then
+            if discover_existing_certificate "${stored_host}"; then
+                info "已重新确认 ${stored_host} 当前使用的证书和稳定源路径。"
+            else
+                PUBLIC_HOST="${stored_host}"; TLS_CERT_FILE="${stored_cert}"; TLS_KEY_FILE="${stored_key}"
+            fi
+        fi
+    elif [[ "${TLS_MODE}" == "auto" && "${stored_mode}" == "ip" ]]; then
+        TLS_MODE="ip"
     fi
     if [[ -n "${TLS_CERT_FILE}" || -n "${TLS_KEY_FILE}" || -n "${PUBLIC_HOST}" ]]; then
         [[ -n "${TLS_CERT_FILE}" && -n "${TLS_KEY_FILE}" && -n "${PUBLIC_HOST}" ]] || \
@@ -692,12 +704,18 @@ install_acme() {
     "${ACME_BIN}" --help 2>&1 | grep -q -- '--certificate-profile' || die "acme.sh 版本不支持 IP 短期证书 profile。"
 }
 
+managed_ip_certificate_is_valid() {
+    local cert_file="${INSTALL_DIR}/certs/fullchain.cer"
+    [[ -f "${cert_file}" ]] && \
+        openssl x509 -checkend 86400 -noout -in "${cert_file}" >/dev/null 2>&1 && \
+        openssl x509 -checkip "${PUBLIC_IP}" -noout -in "${cert_file}" >/dev/null 2>&1
+}
+
 issue_certificate() {
     local cert_file="${INSTALL_DIR}/certs/fullchain.cer"
     local key_file="${INSTALL_DIR}/certs/tls.key"
 
-    if [[ -f "${cert_file}" ]] && openssl x509 -checkend 86400 -noout -in "${cert_file}" >/dev/null 2>&1 && \
-       openssl x509 -in "${cert_file}" -noout -text | grep -Fq "IP Address:${PUBLIC_IP}"; then
+    if managed_ip_certificate_is_valid; then
         ok "现有 IP 证书仍有效，跳过首次签发。"
     else
         info "向 Let's Encrypt 申请短期公网 IP 证书。"
@@ -713,15 +731,26 @@ issue_certificate() {
         --reloadcmd "${INSTALL_DIR}/manage.sh reload-caddy"
 
     openssl x509 -checkend 86400 -noout -in "${cert_file}" >/dev/null 2>&1 || die "签发结果不是有效证书。"
-    openssl x509 -in "${cert_file}" -noout -text | grep -Fq "IP Address:${PUBLIC_IP}" || die "证书 SAN 与公网 IP 不匹配。"
+    openssl x509 -checkip "${PUBLIC_IP}" -noout -in "${cert_file}" >/dev/null 2>&1 || die "证书 SAN 与公网 IP 不匹配。"
     chmod 0644 "${cert_file}"
     chmod 0600 "${key_file}"
 }
 
 install_existing_certificate() {
+    local staging
     validate_existing_certificate
-    install -m 0644 "${TLS_CERT_FILE}" "${INSTALL_DIR}/certs/fullchain.cer"
-    install -m 0600 "${TLS_KEY_FILE}" "${INSTALL_DIR}/certs/tls.key"
+    staging="$(mktemp -d "${INSTALL_DIR}/certs/.incoming.XXXXXX")"
+    if ! install -m 0644 "${TLS_CERT_FILE}" "${staging}/fullchain.cer" || \
+       ! install -m 0600 "${TLS_KEY_FILE}" "${staging}/tls.key" || \
+       ! openssl x509 -checkend 86400 -noout -in "${staging}/fullchain.cer" >/dev/null 2>&1 || \
+       ! certificate_covers_public_host "${staging}/fullchain.cer" || \
+       ! certificate_matches_key "${staging}/fullchain.cer" "${staging}/tls.key"; then
+        rm -rf "${staging}"
+        die "复制现有证书时源文件发生变化或副本校验失败；未替换本项目证书。"
+    fi
+    install -m 0644 "${staging}/fullchain.cer" "${INSTALL_DIR}/certs/fullchain.cer"
+    install -m 0600 "${staging}/tls.key" "${INSTALL_DIR}/certs/tls.key"
+    rm -rf "${staging}"
     ok "已复制并验证 ${PUBLIC_HOST} 的现有证书；原服务仍负责续签。"
 }
 
