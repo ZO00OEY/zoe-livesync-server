@@ -12,6 +12,10 @@ COUCHDB_USER="${COUCHDB_USER:-obsidian_user}"
 COUCHDB_DATABASE="${COUCHDB_DATABASE:-obsidiannotes}"
 HTTPS_PORT="${HTTPS_PORT:-}"
 FIREWALL_MODE="${FIREWALL_MODE:-auto}"
+TLS_MODE="${TLS_MODE:-auto}"
+PUBLIC_HOST="${PUBLIC_HOST:-}"
+TLS_CERT_FILE="${TLS_CERT_FILE:-}"
+TLS_KEY_FILE="${TLS_KEY_FILE:-}"
 PUBLIC_URL=""
 HOST_FIREWALL_STATUS="尚未检查"
 VAULT_PASSPHRASE="${VAULT_PASSPHRASE:-}"
@@ -366,12 +370,155 @@ select_https_port() {
         [[ -n "${HTTPS_PORT}" ]] || die "连续 100 次都未找到空闲随机端口，请通过 HTTPS_PORT 手动指定。"
     fi
 
-    if [[ "${HTTPS_PORT}" == "443" ]]; then
-        PUBLIC_URL="https://${PUBLIC_IP}"
-    else
-        PUBLIC_URL="https://${PUBLIC_IP}:${HTTPS_PORT}"
-    fi
     info "已选定独立随机 HTTPS 端口：${HTTPS_PORT}"
+}
+
+valid_hostname() {
+    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] && [[ "$1" == *.* ]]
+}
+
+certificate_matches_key() {
+    local cert_hash key_hash
+    cert_hash="$(openssl x509 -in "$1" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}' || true)"
+    key_hash="$(openssl pkey -in "$2" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}' || true)"
+    [[ -n "${cert_hash}" && "${cert_hash}" == "${key_hash}" ]]
+}
+
+validate_existing_certificate() {
+    [[ "${TLS_CERT_FILE}" =~ ^/[A-Za-z0-9._/+:-]+$ ]] || die "TLS_CERT_FILE 必须是无空格的安全绝对路径。"
+    [[ "${TLS_KEY_FILE}" =~ ^/[A-Za-z0-9._/+:-]+$ ]] || die "TLS_KEY_FILE 必须是无空格的安全绝对路径。"
+    [[ -r "${TLS_CERT_FILE}" ]] || die "证书文件不可读：${TLS_CERT_FILE}"
+    [[ -r "${TLS_KEY_FILE}" ]] || die "私钥文件不可读：${TLS_KEY_FILE}"
+    valid_hostname "${PUBLIC_HOST}" || die "PUBLIC_HOST 不是有效域名：${PUBLIC_HOST}"
+    openssl x509 -checkend 86400 -noout -in "${TLS_CERT_FILE}" >/dev/null 2>&1 || die "现有证书无效或将在 24 小时内过期。"
+    openssl x509 -checkhost "${PUBLIC_HOST}" -noout -in "${TLS_CERT_FILE}" >/dev/null 2>&1 || die "现有证书不包含域名 ${PUBLIC_HOST}。"
+    certificate_matches_key "${TLS_CERT_FILE}" "${TLS_KEY_FILE}" || die "现有证书与私钥不匹配。"
+}
+
+hostname_points_here() {
+    getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | grep -Fxq "${PUBLIC_IP}"
+}
+
+discover_existing_certificate() {
+    local peer_cert peer_hash file file_hash host key root container_id source destination sni_host
+    local -a roots=() cert_files=() key_files=()
+    peer_cert="$(mktemp)"
+    sni_host="$(hostname -f 2>/dev/null || true)"
+    if valid_hostname "${sni_host}"; then
+        openssl s_client -connect 127.0.0.1:443 -servername "${sni_host}" -showcerts </dev/null 2>/dev/null | \
+            awk '/-----BEGIN CERTIFICATE-----/{copy=1} copy{print} /-----END CERTIFICATE-----/{exit}' > "${peer_cert}" || true
+    else
+        openssl s_client -connect 127.0.0.1:443 -showcerts </dev/null 2>/dev/null | \
+            awk '/-----BEGIN CERTIFICATE-----/{copy=1} copy{print} /-----END CERTIFICATE-----/{exit}' > "${peer_cert}" || true
+    fi
+    if ! openssl x509 -in "${peer_cert}" -noout >/dev/null 2>&1; then
+        rm -f "${peer_cert}"
+        return 1
+    fi
+    peer_hash="$(openssl x509 -in "${peer_cert}" -outform DER | sha256sum | awk '{print $1}')"
+
+    for root in /etc/letsencrypt /var/lib/caddy /root/.local/share/caddy /etc/headscale /var/lib/headscale; do
+        [[ -d "${root}" ]] && roots+=("${root}")
+    done
+    while read -r container_id; do
+        [[ -n "${container_id}" ]] || continue
+        while IFS=$'\t' read -r source destination; do
+            case "${destination}" in
+                *cert*|*ssl*|*tls*|*/etc/headscale*|*/var/lib/headscale*|/data|/data/*)
+                    [[ -e "${source}" ]] && roots+=("${source}")
+                    ;;
+            esac
+        done < <(docker inspect "${container_id}" --format '{{range .Mounts}}{{printf "%s\t%s\n" .Source .Destination}}{{end}}' 2>/dev/null || true)
+    done < <(docker ps --filter publish=443 -q 2>/dev/null || true)
+
+    for root in "${roots[@]}"; do
+        [[ -d "${root}" ]] || root="$(dirname "${root}")"
+        while IFS= read -r -d '' file; do cert_files+=("${file}"); done < <(
+            find -L "${root}" -maxdepth 6 -type f \( -name '*.crt' -o -name '*.cer' -o -name '*.pem' \) -print0 2>/dev/null
+        )
+        while IFS= read -r -d '' file; do key_files+=("${file}"); done < <(
+            find -L "${root}" -maxdepth 6 -type f \( -name '*.key' -o -name 'privkey*.pem' -o -name 'key.pem' \) -print0 2>/dev/null
+        )
+    done
+
+    for file in "${cert_files[@]}"; do
+        file_hash="$(openssl x509 -in "${file}" -outform DER 2>/dev/null | sha256sum | awk '{print $1}' || true)"
+        [[ "${file_hash}" == "${peer_hash}" ]] || continue
+        while read -r host; do
+            host="${host#DNS:}"
+            [[ "${host}" == \** ]] && continue
+            valid_hostname "${host}" || continue
+            hostname_points_here "${host}" || continue
+            curl --noproxy '*' --resolve "${host}:443:127.0.0.1" -sS --connect-timeout 5 --max-time 10 \
+                -o /dev/null "https://${host}/" 2>/dev/null || continue
+            for key in "${key_files[@]}"; do
+                if certificate_matches_key "${file}" "${key}"; then
+                    PUBLIC_HOST="${host}"
+                    TLS_CERT_FILE="${file}"
+                    TLS_KEY_FILE="${key}"
+                    rm -f "${peer_cert}"
+                    return 0
+                fi
+            done
+        done < <(openssl x509 -in "${file}" -noout -ext subjectAltName 2>/dev/null | grep -oE 'DNS:[^, ]+' || true)
+    done
+    rm -f "${peer_cert}"
+    return 1
+}
+
+select_tls_mode() {
+    local answer stored_mode="" stored_host="" stored_cert="" stored_key=""
+    if [[ -f "${INSTALL_DIR}/.env" ]]; then
+        stored_mode="$(sed -n 's/^TLS_MODE=//p' "${INSTALL_DIR}/.env" | head -n 1)"
+        stored_host="$(sed -n 's/^PUBLIC_HOST=//p' "${INSTALL_DIR}/.env" | head -n 1)"
+        stored_cert="$(sed -n 's/^TLS_CERT_FILE=//p' "${INSTALL_DIR}/.env" | head -n 1)"
+        stored_key="$(sed -n 's/^TLS_KEY_FILE=//p' "${INSTALL_DIR}/.env" | head -n 1)"
+    fi
+    if [[ "${TLS_MODE}" == "auto" && "${stored_mode}" == "existing" && -n "${stored_host}" ]]; then
+        TLS_MODE="existing"; PUBLIC_HOST="${stored_host}"; TLS_CERT_FILE="${stored_cert}"; TLS_KEY_FILE="${stored_key}"
+    fi
+    if [[ -n "${TLS_CERT_FILE}" || -n "${TLS_KEY_FILE}" || -n "${PUBLIC_HOST}" ]]; then
+        [[ -n "${TLS_CERT_FILE}" && -n "${TLS_KEY_FILE}" && -n "${PUBLIC_HOST}" ]] || \
+            die "复用证书时必须同时提供 PUBLIC_HOST、TLS_CERT_FILE 和 TLS_KEY_FILE。"
+        TLS_MODE="existing"
+    fi
+
+    case "${TLS_MODE}" in
+        existing)
+            validate_existing_certificate
+            ;;
+        ip)
+            PUBLIC_HOST="${PUBLIC_IP}"
+            ;;
+        auto)
+            if port_is_busy 443 && discover_existing_certificate; then
+                info "检测到当前 HTTPS 证书：${PUBLIC_HOST}"
+                info "证书文件：${TLS_CERT_FILE}"
+                if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+                    die "非交互模式不会自动复用现有私钥；请明确传入 PUBLIC_HOST、TLS_CERT_FILE、TLS_KEY_FILE。"
+                fi
+                printf '1. 复用该证书（推荐，不停止现有服务）\n2. 不复用并退出\n请选择 [1]: '
+                read -r answer
+                [[ -z "${answer}" || "${answer}" == "1" ]] || die "已取消安装，未修改现有服务。"
+                TLS_MODE="existing"
+                validate_existing_certificate
+            elif port_is_busy 80; then
+                ss -H -ltnp 'sport = :80' 2>/dev/null >&2 || true
+                die "80 端口已被占用，且没有找到可安全复用的证书与私钥；脚本不会停止现有服务。"
+            else
+                TLS_MODE="ip"
+                PUBLIC_HOST="${PUBLIC_IP}"
+            fi
+            ;;
+        *) die "TLS_MODE 只能是 auto、ip 或 existing。" ;;
+    esac
+
+    if [[ "${HTTPS_PORT}" == "443" ]]; then
+        PUBLIC_URL="https://${PUBLIC_HOST}"
+    else
+        PUBLIC_URL="https://${PUBLIC_HOST}:${HTTPS_PORT}"
+    fi
+    ok "HTTPS 模式：$([[ "${TLS_MODE}" == "existing" ]] && printf '复用现有域名证书' || printf '公网 IP 证书')；访问地址 ${PUBLIC_URL}"
 }
 
 check_local_service_ports() {
@@ -396,22 +543,24 @@ custom_firewall_is_restrictive() {
 
 configure_host_firewall() {
     local port zone route_interface
+    local -a required_ports=("${HTTPS_PORT}")
+    [[ "${TLS_MODE}" == "ip" ]] && required_ports=(80 "${HTTPS_PORT}")
 
     case "${FIREWALL_MODE}" in
         auto) ;;
         skip)
             HOST_FIREWALL_STATUS="已按 FIREWALL_MODE=skip 跳过自动配置"
-            warn "已跳过主机防火墙配置；请自行确认 TCP 80 和 TCP ${HTTPS_PORT} 可入站。"
+            warn "已跳过主机防火墙配置；请自行确认 TCP ${required_ports[*]} 可入站。"
             return
             ;;
         *) die "FIREWALL_MODE 只能是 auto 或 skip。" ;;
     esac
 
     if command_exists ufw && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
-        for port in 80 "${HTTPS_PORT}"; do
+        for port in "${required_ports[@]}"; do
             ufw allow "${port}/tcp" >/dev/null || die "UFW 放行 TCP ${port} 失败。"
         done
-        HOST_FIREWALL_STATUS="UFW 已自动放行 TCP 80 和 TCP ${HTTPS_PORT}"
+        HOST_FIREWALL_STATUS="UFW 已自动放行 TCP ${required_ports[*]}"
         ok "${HOST_FIREWALL_STATUS}。"
         return
     fi
@@ -425,18 +574,18 @@ configure_host_firewall() {
         [[ -n "${zone}" ]] || zone="$(firewall-cmd --get-default-zone 2>/dev/null || true)"
         [[ -n "${zone}" ]] || die "无法确定公网默认路由所属的 firewalld zone，请使用 FIREWALL_MODE=skip 后手动放行。"
         firewall-cmd --get-zones 2>/dev/null | tr ' ' '\n' | grep -Fxq "${zone}" || die "firewalld zone ${zone} 不存在。"
-        for port in 80 "${HTTPS_PORT}"; do
+        for port in "${required_ports[@]}"; do
             firewall-cmd --zone="${zone}" --add-port="${port}/tcp" >/dev/null || die "firewalld 临时放行 TCP ${port} 失败。"
             firewall-cmd --permanent --zone="${zone}" --add-port="${port}/tcp" >/dev/null || die "firewalld 永久放行 TCP ${port} 失败。"
         done
-        HOST_FIREWALL_STATUS="firewalld 区域 ${zone}${route_interface:+（公网路由接口 ${route_interface}）} 已自动放行 TCP 80 和 TCP ${HTTPS_PORT}"
+        HOST_FIREWALL_STATUS="firewalld 区域 ${zone}${route_interface:+（公网路由接口 ${route_interface}）} 已自动放行 TCP ${required_ports[*]}"
         ok "${HOST_FIREWALL_STATUS}。"
         return
     fi
 
     if custom_firewall_is_restrictive; then
         HOST_FIREWALL_STATUS="检测到自定义 nftables/iptables 入站限制，未自动修改"
-        warn "${HOST_FIREWALL_STATUS}；请手动放行 TCP 80 和 TCP ${HTTPS_PORT}。"
+        warn "${HOST_FIREWALL_STATUS}；请手动放行 TCP ${required_ports[*]}。"
     else
         HOST_FIREWALL_STATUS="未检测到启用中的 UFW/firewalld；未新增主机防火墙规则"
         info "${HOST_FIREWALL_STATUS}。"
@@ -453,6 +602,7 @@ prepare_files() {
     install -m 0755 "${SOURCE_DIR}/manage.sh" "${INSTALL_DIR}/manage.sh"
 
     local password="${COUCHDB_PASSWORD:-}" confirmed_ip="${PUBLIC_IP}" confirmed_url="${PUBLIC_URL}" confirmed_port="${HTTPS_PORT}"
+    local confirmed_tls_mode="${TLS_MODE}" confirmed_host="${PUBLIC_HOST}" confirmed_cert="${TLS_CERT_FILE}" confirmed_key="${TLS_KEY_FILE}"
     local requested_vault_passphrase="${VAULT_PASSPHRASE}" requested_uri_passphrase="${SETUP_URI_PASSPHRASE}"
     if [[ -f "${INSTALL_DIR}/.env" ]]; then
         # shellcheck source=/dev/null
@@ -462,6 +612,10 @@ prepare_files() {
     PUBLIC_IP="${confirmed_ip}"
     PUBLIC_URL="${confirmed_url}"
     HTTPS_PORT="${confirmed_port}"
+    TLS_MODE="${confirmed_tls_mode}"
+    PUBLIC_HOST="${confirmed_host}"
+    TLS_CERT_FILE="${confirmed_cert}"
+    TLS_KEY_FILE="${confirmed_key}"
     [[ -n "${requested_vault_passphrase}" ]] && VAULT_PASSPHRASE="${requested_vault_passphrase}"
     [[ -n "${requested_uri_passphrase}" ]] && SETUP_URI_PASSPHRASE="${requested_uri_passphrase}"
     [[ -n "${password}" ]] || password="$(openssl rand -hex 32)"
@@ -474,6 +628,10 @@ COUCHDB_DATABASE=${COUCHDB_DATABASE}
 PUBLIC_IP=${PUBLIC_IP}
 PUBLIC_URL=${PUBLIC_URL}
 HTTPS_PORT=${HTTPS_PORT}
+TLS_MODE=${TLS_MODE}
+PUBLIC_HOST=${PUBLIC_HOST}
+TLS_CERT_FILE=${TLS_CERT_FILE}
+TLS_KEY_FILE=${TLS_KEY_FILE}
 VAULT_PASSPHRASE=${VAULT_PASSPHRASE}
 SETUP_URI_PASSPHRASE=${SETUP_URI_PASSPHRASE}
 EOF
@@ -487,8 +645,8 @@ write_https_caddyfile() {
     auto_https off
 }
 
-https://${PUBLIC_IP} {
-    tls /certs/fullchain.cer /certs/${PUBLIC_IP}.key
+https://${PUBLIC_HOST} {
+    tls /certs/fullchain.cer /certs/tls.key
     reverse_proxy couchdb:5984 {
         flush_interval -1
     }
@@ -520,7 +678,7 @@ install_acme() {
 
 issue_certificate() {
     local cert_file="${INSTALL_DIR}/certs/fullchain.cer"
-    local key_file="${INSTALL_DIR}/certs/${PUBLIC_IP}.key"
+    local key_file="${INSTALL_DIR}/certs/tls.key"
 
     if [[ -f "${cert_file}" ]] && openssl x509 -checkend 86400 -noout -in "${cert_file}" >/dev/null 2>&1 && \
        openssl x509 -in "${cert_file}" -noout -text | grep -Fq "IP Address:${PUBLIC_IP}"; then
@@ -542,6 +700,22 @@ issue_certificate() {
     openssl x509 -in "${cert_file}" -noout -text | grep -Fq "IP Address:${PUBLIC_IP}" || die "证书 SAN 与公网 IP 不匹配。"
     chmod 0644 "${cert_file}"
     chmod 0600 "${key_file}"
+}
+
+install_existing_certificate() {
+    validate_existing_certificate
+    install -m 0644 "${TLS_CERT_FILE}" "${INSTALL_DIR}/certs/fullchain.cer"
+    install -m 0600 "${TLS_KEY_FILE}" "${INSTALL_DIR}/certs/tls.key"
+    ok "已复制并验证 ${PUBLIC_HOST} 的现有证书；原服务仍负责续签。"
+}
+
+prepare_tls_certificate() {
+    if [[ "${TLS_MODE}" == "existing" ]]; then
+        install_existing_certificate
+    else
+        install_acme
+        issue_certificate
+    fi
 }
 
 install_renewal_schedule() {
@@ -592,6 +766,16 @@ verify_couchdb_configuration() {
 }
 
 write_connection_file() {
+    local firewall_note port_note certificate_note
+    if [[ "${TLS_MODE}" == "existing" ]]; then
+        firewall_note="请确认 TCP ${HTTPS_PORT} 已放行。"
+        port_note="TCP ${HTTPS_PORT} 用于 LiveSync HTTPS 连接；现有服务继续占用自己的 80/443。"
+        certificate_note="复用 ${PUBLIC_HOST} 的现有证书；原服务负责续签，Zoe 定时同步并重载自己的 Caddy。"
+    else
+        firewall_note="请确认 TCP 80 和 TCP ${HTTPS_PORT} 已放行。"
+        port_note="TCP 80 用于首次签发及自动续期 IP 证书；TCP ${HTTPS_PORT} 用于 LiveSync HTTPS 连接。"
+        certificate_note="由 Zoe 管理 Let's Encrypt 公网 IP 短期证书。"
+    fi
     cat > "${INSTALL_DIR}/connection.txt" <<EOF
 第一部分：CouchDB API 连接信息
 
@@ -602,10 +786,11 @@ HTTPS 端口: ${HTTPS_PORT}
 用户名: ${COUCHDB_USER}
 密码: ${COUCHDB_PASSWORD}
 数据库: ${COUCHDB_DATABASE}
+证书方式: ${certificate_note}
 
 主机防火墙: ${HOST_FIREWALL_STATUS}
-云安全组: 通用服务器脚本无法修改，请确认 TCP 80 和 TCP ${HTTPS_PORT} 已放行。
-端口说明: TCP 80 用于首次签发及自动续期 IP 证书；TCP ${HTTPS_PORT} 用于 LiveSync HTTPS 连接。
+云安全组: 通用服务器脚本无法修改，${firewall_note}
+端口说明: ${port_note}
 
 注意：首次设备请使用一个单独保存的端到端加密口令；它不是上面的 CouchDB 密码。
 EOF
@@ -616,16 +801,16 @@ verify_installation() {
     compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
     local body
     body="$(curl --noproxy '*' -fsS --connect-timeout 5 --max-time 15 \
-        --resolve "${PUBLIC_IP}:${HTTPS_PORT}:127.0.0.1" \
+        --resolve "${PUBLIC_HOST}:${HTTPS_PORT}:127.0.0.1" \
         --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "${PUBLIC_URL}/_up")" || die "本机 HTTPS、证书或 Caddy 验证失败。"
     grep -q '"status":"ok"' <<< "${body}" || die "HTTPS 已响应，但 CouchDB 健康检查内容不正确。"
     ok "本机 HTTPS、证书、Caddy 与 CouchDB 端到端验证通过。"
 
     if curl --noproxy '*' -fsS --connect-timeout 5 --max-time 15 \
         --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "${PUBLIC_URL}/_up" 2>/dev/null | grep -q '"status":"ok"'; then
-        ok "服务器经公网 IP 回环访问验证通过。"
+        ok "服务器经公网地址回环访问验证通过。"
     else
-        warn "服务器无法经自己的公网 IP 回环访问；这不一定代表外部不可用，请从手机网络访问 ${PUBLIC_URL}/_up 验证云安全组。"
+        warn "服务器无法经自己的公网地址回环访问；这不一定代表外部不可用，请从手机网络访问 ${PUBLIC_URL}/_up 验证云安全组。"
     fi
 }
 
@@ -636,6 +821,10 @@ usage() {
 环境变量：
   PUBLIC_IP          明确指定公网 IPv4
   HTTPS_PORT         可选；不指定时随机选择 20000-29999 中的空闲端口
+  TLS_MODE           auto（默认）、ip 或 existing
+  PUBLIC_HOST        复用证书时使用的域名
+  TLS_CERT_FILE      复用证书时的完整证书链绝对路径
+  TLS_KEY_FILE       复用证书时的私钥绝对路径
   FIREWALL_MODE      主机防火墙处理方式：auto（默认）或 skip
   COUCHDB_USER       CouchDB 用户名，默认 obsidian_user
   COUCHDB_PASSWORD   CouchDB 密码；不指定则随机生成
@@ -683,6 +872,7 @@ main() {
     ensure_docker
     choose_ip_candidate
     select_https_port
+    select_tls_mode
     check_local_service_ports
     configure_host_firewall
 
@@ -691,8 +881,7 @@ main() {
     wait_for_couchdb
     provision_couchdb
     verify_couchdb_configuration
-    install_acme
-    issue_certificate
+    prepare_tls_certificate
     install_renewal_schedule
     write_https_caddyfile
     compose up -d caddy

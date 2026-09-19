@@ -44,6 +44,8 @@ export HTTPS_PORT="8443"
 # shellcheck disable=SC2329
 port_is_busy() { return 1; }
 select_https_port >/dev/null
+TLS_MODE="auto"
+select_tls_mode >/dev/null
 [[ "${PUBLIC_URL}" == "https://8.8.8.8:8443" ]] || {
     echo "Unexpected public URL: ${PUBLIC_URL}" >&2
     exit 1
@@ -76,5 +78,25 @@ configure_host_firewall >/dev/null 2>&1
     echo "Unexpected firewall status: ${HOST_FIREWALL_STATUS}" >&2
     exit 1
 }
+
+cert_test_dir="$(mktemp -d)"
+cert_subject='/CN=sync.example.com'
+[[ "${OSTYPE:-}" == msys* ]] && cert_subject='//CN=sync.example.com'
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+    -subj "${cert_subject}" \
+    -keyout "${cert_test_dir}/source.key" -out "${cert_test_dir}/source.pem" >/dev/null 2>&1
+INSTALL_DIR="${cert_test_dir}/install"
+PUBLIC_HOST="sync.example.com"
+TLS_CERT_FILE="${cert_test_dir}/source.pem"
+TLS_KEY_FILE="${cert_test_dir}/source.key"
+TLS_MODE="existing"
+mkdir -p "${INSTALL_DIR}/config" "${INSTALL_DIR}/certs"
+validate_existing_certificate
+install_existing_certificate >/dev/null
+write_https_caddyfile
+grep -Fq 'https://sync.example.com' "${INSTALL_DIR}/config/Caddyfile"
+grep -Fq 'tls /certs/fullchain.cer /certs/tls.key' "${INSTALL_DIR}/config/Caddyfile"
+certificate_matches_key "${INSTALL_DIR}/certs/fullchain.cer" "${INSTALL_DIR}/certs/tls.key"
+rm -rf "${cert_test_dir}"
 
 echo "Self-test passed."

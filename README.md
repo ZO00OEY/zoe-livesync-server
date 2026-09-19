@@ -1,6 +1,6 @@
 # Zoe LiveSync Server
 
-完全独立的一键安装项目，为 Obsidian Self-hosted LiveSync 部署 CouchDB、独立 Caddy 入口和 Let's Encrypt 公网 IP 短期证书。
+完全独立的一键安装项目，为 Obsidian Self-hosted LiveSync 部署 CouchDB、独立 Caddy 入口和 HTTPS 证书。
 
 本项目不依赖、读取或修改任何旧项目，也不改写服务器上已有的 Caddy、Nginx 或代理节点配置。
 
@@ -15,10 +15,11 @@
 - 不显示或接受局域网、CGNAT、回环、文档示例及其他保留地址。
 - 候选 IP 不一致时明确警告，由用户确认，不静默猜测。
 - 重跑时优先显示上次确认的公网 IP，同时重新检测并要求确认；上次结果与本次建议不一致时醒目警告。
-- 使用 `acme.sh` 和 Let's Encrypt `shortlived` profile 签发公网 IP 证书。
+- 80 空闲时，使用 `acme.sh` 和 Let's Encrypt `shortlived` profile 签发公网 IP 证书。
+- 443 已有 HTTPS 服务时，尝试识别其域名证书，并在证书、私钥、域名解析全部匹配后询问是否复用；不会停止原服务。
 - 默认从 `20000-29999` 随机选择一个未占用的独立 HTTPS 端口，并在安装结束时醒目显示。
 - 重跑时如果上次自动保存的端口已被其他服务占用，会重新随机选择；用户明确指定的端口被占用时则停止，避免擅自改动指定配置。
-- 检测到已启用的 UFW 或 firewalld 时，自动、持久放行 TCP 80 和最终选中的 HTTPS 端口。
+- 检测到已启用的 UFW 或 firewalld 时，自动、持久放行实际需要的端口；复用证书时不额外开放 TCP 80。
 - 不停止、不改写、不接管服务器上已有的代理节点。
 - 使用项目独立的 acme.sh 目录，每 12 小时只检查本项目 IP 证书；不删除、改写或调用服务器已有的 acme.sh 证书任务。证书更新后自动重载本项目自己的 Caddy。
 - CouchDB 仅绑定 `127.0.0.1:5984`，不会把数据库原始端口暴露到公网。
@@ -40,10 +41,25 @@ sudo bash install.sh
 https://公网IP:随机端口
 ```
 
+如果检测到可安全复用的现有域名证书，也可以得到：
+
+```text
+https://现有域名:随机端口
+```
+
 如果需要明确指定：
 
 ```bash
 sudo PUBLIC_IP=你的公网IP HTTPS_PORT=8443 bash install.sh
+```
+
+也可以明确指定要复用的现有证书。三个参数必须同时提供，脚本会检查有效期、域名和私钥是否匹配：
+
+```bash
+sudo PUBLIC_HOST=sync.example.com \
+  TLS_CERT_FILE=/etc/letsencrypt/live/sync.example.com/fullchain.pem \
+  TLS_KEY_FILE=/etc/letsencrypt/live/sync.example.com/privkey.pem \
+  bash install.sh
 ```
 
 非交互安装必须明确指定公网 IP：
@@ -116,7 +132,7 @@ sudo /opt/zoe-livesync-server/manage.sh uri
 
 ## 端口要求
 
-- TCP 80：只在申请和续期 IP 证书时临时使用，不会常驻监听，但届时必须允许公网访问。
+- TCP 80：只在申请和续期 IP 证书时临时使用；复用现有证书时不需要。
 - TCP 20000-29999 中最终选中的一个端口：本项目独立的 HTTPS 服务端口。
 - TCP 5984：仅监听服务器回环地址，不应在云安全组中开放。
 
@@ -127,9 +143,9 @@ sudo /opt/zoe-livesync-server/manage.sh uri
 - UFW/firewalld 未启用：不会擅自安装或开启防火墙。
 - 检测到自定义 nftables/iptables 默认拒绝入站：只给出警告，不直接改写规则，以免影响已有代理或其他服务。
 
-云厂商控制台中的“安全组”在服务器外部，通用脚本没有云账号 API 权限，无法自动修改。仍需在云服务商控制台确认 TCP 80 和最终选中的 HTTPS 端口已放行；TCP 5984 不要放行。
+云厂商控制台中的“安全组”在服务器外部，通用脚本没有云账号 API 权限，无法自动修改。IP 证书模式需确认 TCP 80 和最终 HTTPS 端口已放行；复用证书时只需放行最终 HTTPS 端口。TCP 5984 不要放行。
 
-如果 TCP 80 当前被其他服务长期占用，脚本会停止证书申请并显示占用信息，不会停止原服务。后续会增加与其他入口共用 HTTP-01 验证目录的可选模式。
+如果 TCP 80 被占用，脚本会先检查 443 当前提供的证书，再在常见证书目录和占用 443 的 Docker 容器挂载中查找匹配私钥。只有域名指向本机公网 IP、证书有效且私钥匹配时才会建议复用；否则停止并显示原因，不会停止原服务。复用模式不会接管证书续签，只会定时同步更新后的证书并重载本项目 Caddy。
 
 安装前还会检查本机 `127.0.0.1:5984`。如果它由本项目 CouchDB 使用，可以安全重跑；如果由其他进程或容器使用，脚本会停止，避免覆盖或接管既有数据库。
 
@@ -146,7 +162,7 @@ sudo /opt/zoe-livesync-server/manage.sh uri
 本项目会选择另一个端口：
 
 ```text
-Obsidian LiveSync → https://服务器IP:随机端口
+Obsidian LiveSync → https://服务器IP或已有域名:随机端口
 ```
 
 两套服务由各自的进程和配置管理。新脚本不会查找旧项目的注释、路由目录或配置文件。
@@ -154,8 +170,8 @@ Obsidian LiveSync → https://服务器IP:随机端口
 ## 当前边界
 
 - 第一版只处理 Server A（CouchDB 同步端）。Server C 发布端将在后续模块实现。
-- 第一版自动证书流程只支持公网 IPv4。
-- 云服务器安全组需要放行 TCP 80 和最终选择的 HTTPS 端口。
+- 自动 IP 证书流程只支持公网 IPv4；现有证书模式支持解析到该 IPv4 的普通域名。
+- IP 证书模式需要放行 TCP 80 和最终 HTTPS 端口；复用证书时只需最终 HTTPS 端口。
 - IP 变化后，证书和客户端连接地址需要重新生成。
 - 端到端加密口令由用户在 Self-hosted LiveSync 中另行设置并保管。
 

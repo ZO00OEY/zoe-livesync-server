@@ -24,11 +24,31 @@ compose() {
     fi
 }
 
+certificate_matches_key() {
+    local cert_hash key_hash
+    cert_hash="$(openssl x509 -in "$1" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}' || true)"
+    key_hash="$(openssl pkey -in "$2" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}' || true)"
+    [[ -n "${cert_hash}" && "${cert_hash}" == "${key_hash}" ]]
+}
+
+sync_existing_certificate() {
+    [[ -r "${TLS_CERT_FILE}" && -r "${TLS_KEY_FILE}" ]]
+    openssl x509 -checkend 86400 -noout -in "${TLS_CERT_FILE}"
+    openssl x509 -checkhost "${PUBLIC_HOST}" -noout -in "${TLS_CERT_FILE}" >/dev/null
+    certificate_matches_key "${TLS_CERT_FILE}" "${TLS_KEY_FILE}"
+    if ! cmp -s "${TLS_CERT_FILE}" "${install_dir}/certs/fullchain.cer" || \
+       ! cmp -s "${TLS_KEY_FILE}" "${install_dir}/certs/tls.key"; then
+        install -m 0644 "${TLS_CERT_FILE}" "${install_dir}/certs/fullchain.cer"
+        install -m 0600 "${TLS_KEY_FILE}" "${install_dir}/certs/tls.key"
+        "$0" reload-caddy
+    fi
+}
+
 case "${1:-status}" in
     status)
         compose ps
         echo
-        curl --noproxy '*' -fsS --resolve "${PUBLIC_IP}:${HTTPS_PORT}:127.0.0.1" \
+        curl --noproxy '*' -fsS --resolve "${PUBLIC_HOST:-${PUBLIC_IP}}:${HTTPS_PORT}:127.0.0.1" \
             --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "${PUBLIC_URL}/_up" && echo
         curl -fsS --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" \
             "http://127.0.0.1:5984/${COUCHDB_DATABASE}" >/dev/null
@@ -52,7 +72,11 @@ case "${1:-status}" in
         ;;
     renew)
         trap 'printf "续期失败时间: %s\n请重试: %s renew\n" "$(date -Is)" "$0" > "${failure_file}"' ERR
-        "${acme_home}/acme.sh" --cron --home "${acme_home}"
+        if [[ "${TLS_MODE:-ip}" == "existing" ]]; then
+            sync_existing_certificate
+        else
+            "${acme_home}/acme.sh" --cron --home "${acme_home}"
+        fi
         openssl x509 -checkend 86400 -noout -in "${install_dir}/certs/fullchain.cer"
         rm -f "${failure_file}"
         ;;
