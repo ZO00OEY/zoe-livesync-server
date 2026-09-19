@@ -29,9 +29,9 @@ valid_ipv4() {
 }
 
 is_public_ipv4() {
-    local ip="$1" a b c d
+    local ip="$1" a b c
     valid_ipv4 "${ip}" || return 1
-    IFS=. read -r a b c d <<< "${ip}"
+    IFS=. read -r a b c _ <<< "${ip}"
 
     (( a == 0 || a == 10 || a == 127 || a >= 224 )) && return 1
     (( a == 100 && b >= 64 && b <= 127 )) && return 1
@@ -296,7 +296,7 @@ prepare_files() {
 
     local password="${COUCHDB_PASSWORD:-}" confirmed_ip="${PUBLIC_IP}"
     if [[ -f "${INSTALL_DIR}/.env" ]]; then
-        # shellcheck disable=SC1090
+        # shellcheck source=/dev/null
         source "${INSTALL_DIR}/.env"
         password="${COUCHDB_PASSWORD}"
     fi

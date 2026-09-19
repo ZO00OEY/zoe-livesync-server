@@ -7,6 +7,7 @@ bash -n "${root_dir}/install.sh"
 bash -n "${root_dir}/manage.sh"
 sh -n "${root_dir}/scripts/couchdb-init.sh"
 
+# shellcheck disable=SC1091
 source "${root_dir}/install.sh" --source-only
 
 public_cases=("1.1.1.1" "8.8.8.8" "223.5.5.5")
