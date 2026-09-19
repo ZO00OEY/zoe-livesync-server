@@ -27,6 +27,15 @@ for ip in "${private_cases[@]}"; do
     fi
 done
 
+( command_exists() { return 0; }; base_tools_ready ) || {
+    echo "Complete base tools should be accepted" >&2
+    exit 1
+}
+if ( command_exists() { [[ "$1" != "socat" ]]; }; base_tools_ready ); then
+    echo "Missing base tool should be rejected" >&2
+    exit 1
+fi
+
 export INSTALL_DIR="${TMPDIR:-/tmp}/zoe-livesync-self-test-missing"
 export PUBLIC_IP="8.8.8.8"
 export HTTPS_PORT="8443"
@@ -42,7 +51,12 @@ select_https_port >/dev/null
 # has since been claimed by an unrelated process.
 port_test_dir="$(mktemp -d)"
 printf '%s\n' 'HTTPS_PORT=24567' > "${port_test_dir}/.env"
+printf '%s\n' 'PUBLIC_IP=8.8.4.4' >> "${port_test_dir}/.env"
 INSTALL_DIR="${port_test_dir}"
+[[ "$(stored_public_ip)" == "8.8.4.4" ]] || {
+    echo "Stored public IP was not loaded" >&2
+    exit 1
+}
 HTTPS_PORT=""
 # shellcheck disable=SC2329
 port_is_busy() { [[ "$1" == "24567" ]]; }

@@ -97,8 +97,16 @@ collect_ip_candidates() {
     done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}' || true)
 }
 
+stored_public_ip() {
+    local value=""
+    if [[ -f "${INSTALL_DIR}/.env" ]]; then
+        value="$(sed -n 's/^PUBLIC_IP=//p' "${INSTALL_DIR}/.env" | head -n 1)"
+    fi
+    is_public_ipv4 "${value}" && printf '%s\n' "${value}"
+}
+
 choose_ip_candidate() {
-    local i value answer best_ip="" best_count=0 source_list
+    local i value answer best_ip="" best_count=0 source_list stored_ip default_ip
     declare -A counts=()
     declare -A sources=()
     local -a unique_ips=()
@@ -108,8 +116,11 @@ choose_ip_candidate() {
         return
     fi
 
+    stored_ip="$(stored_public_ip || true)"
     collect_ip_candidates
-    ((${#IP_VALUES[@]} > 0)) || die "没有检测到公网 IPv4；可用 PUBLIC_IP=公网IP 指定。"
+    if ((${#IP_VALUES[@]} == 0)) && [[ -z "${stored_ip}" ]]; then
+        die "没有检测到公网 IPv4；可用 PUBLIC_IP=公网IP 指定。"
+    fi
 
     for i in "${!IP_VALUES[@]}"; do
         value="${IP_VALUES[$i]}"
@@ -126,7 +137,10 @@ choose_ip_candidate() {
     done
 
     echo
-    echo "检测到以下公网 IPv4 候选（局域网、CGNAT、回环及保留地址已过滤）："
+    if [[ -n "${stored_ip}" ]]; then
+        echo "上次确认的公网 IPv4：${stored_ip}"
+    fi
+    echo "本次检测到的公网 IPv4 候选（局域网、CGNAT、回环及保留地址已过滤）："
     for i in "${!unique_ips[@]}"; do
         value="${unique_ips[$i]}"
         printf '  %d) %s\n     来源：%s\n' "$((i + 1))" "${value}" "${sources["${value}"]}"
@@ -135,15 +149,31 @@ choose_ip_candidate() {
     if ((${#counts[@]} > 1)); then
         warn "不同来源结果不一致，可能存在代理、透明网关或多出口网络。"
     fi
-    printf '建议使用: %s（%d 个来源一致）\n' "${best_ip}" "${best_count}"
-
-    if [[ "${NON_INTERACTIVE}" == "1" || ! -r /dev/tty ]]; then
-        die "非交互模式不会替你确认候选 IP；请重新运行 PUBLIC_IP=${best_ip} NON_INTERACTIVE=1 bash install.sh"
+    if [[ -n "${best_ip}" ]]; then
+        printf '本次检测建议: %s（%d 个来源一致）\n' "${best_ip}" "${best_count}"
+    fi
+    if [[ -n "${stored_ip}" ]]; then
+        default_ip="${stored_ip}"
+        if [[ -n "${best_ip}" && "${stored_ip}" != "${best_ip}" ]]; then
+            warn "上次确认值与本次检测建议不一致，请仔细确认。"
+        else
+            ok "上次确认值与本次检测结果一致。"
+        fi
+    else
+        default_ip="${best_ip}"
     fi
 
-    read -r -p "回车确认，输入候选序号，或输入正确的公网 IPv4: " answer </dev/tty
+    if [[ "${NON_INTERACTIVE}" == "1" || ! -r /dev/tty ]]; then
+        die "非交互模式不会替你确认候选 IP；请重新运行 PUBLIC_IP=${default_ip} NON_INTERACTIVE=1 bash install.sh"
+    fi
+
+    if [[ -n "${stored_ip}" ]]; then
+        read -r -p "回车继续使用上次确认值 ${stored_ip}，输入候选序号，或输入正确的公网 IPv4: " answer </dev/tty
+    else
+        read -r -p "回车确认建议值 ${best_ip}，输入候选序号，或输入正确的公网 IPv4: " answer </dev/tty
+    fi
     if [[ -z "${answer}" ]]; then
-        PUBLIC_IP="${best_ip}"
+        PUBLIC_IP="${default_ip}"
     elif [[ "${answer}" =~ ^[0-9]+$ ]] && (( 10#${answer} >= 1 && 10#${answer} <= ${#unique_ips[@]} )); then
         PUBLIC_IP="${unique_ips[$((10#${answer} - 1))]}"
     else
@@ -176,7 +206,22 @@ detect_system() {
     info "安装路径：$([[ "${INSTALL_MODE}" == direct ]] && echo '官方直接安装' || echo '兼容性安装')"
 }
 
+base_tools_ready() {
+    local tool
+    for tool in curl openssl ip ss socat; do
+        command_exists "${tool}" || return 1
+    done
+    command_exists cron || command_exists crond || return 1
+    if command_exists apt-get; then
+        command_exists gpg || return 1
+    fi
+}
+
 install_base_packages() {
+    if base_tools_ready; then
+        ok "基础工具已完整，跳过系统软件包安装。"
+        return
+    fi
     if command_exists apt-get; then
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates openssl iproute2 cron gnupg socat
@@ -193,6 +238,7 @@ install_base_packages() {
     else
         die "未识别包管理器，请先安装 curl、openssl、iproute2、cron、Docker 和 Compose。"
     fi
+    base_tools_ready || die "基础工具安装后仍不完整。"
 }
 
 docker_ready() {
