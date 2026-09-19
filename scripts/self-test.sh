@@ -27,11 +27,13 @@ for ip in "${private_cases[@]}"; do
     fi
 done
 
-( command_exists() { return 0; }; base_tools_ready ) || {
+( # shellcheck disable=SC2329
+  command_exists() { return 0; }; base_tools_ready ) || {
     echo "Complete base tools should be accepted" >&2
     exit 1
 }
-if ( command_exists() { [[ "$1" != "socat" ]]; }; base_tools_ready ); then
+if ( # shellcheck disable=SC2329
+     command_exists() { [[ "$1" != "socat" ]]; }; base_tools_ready ); then
     echo "Missing base tool should be rejected" >&2
     exit 1
 fi
