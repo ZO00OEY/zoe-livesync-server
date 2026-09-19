@@ -50,8 +50,11 @@ case "${1:-status}" in
     setup-uri)
         "${install_dir}/scripts/generate-setup-uri.sh"
         ;;
+    uri)
+        cat "${install_dir}/setup-uri-only.txt"
+        ;;
     *)
-        echo "用法: $0 {status|logs [service]|restart|renew|config|setup-uri}" >&2
+        echo "用法: $0 {status|logs [service]|restart|renew|config|setup-uri|uri}" >&2
         exit 2
         ;;
 esac

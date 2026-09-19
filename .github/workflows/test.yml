@@ -27,13 +27,19 @@ jobs:
           docker compose config --quiet
       - name: Generate a Self-hosted LiveSync setup URI
         run: |
-          output="$(docker run --rm \
-            -e hostname=https://127.0.0.1:23456 \
-            -e database=obsidiannotes \
-            -e username=test_user \
-            -e password=0123456789abcdef0123456789abcdef \
-            -e passphrase=11111111111111111111111111111111 \
-            -e uri_passphrase=22222222222222222222222222222222 \
-            denoland/deno:alpine-2.9.7 run --minimum-dependency-age=0 --allow-env \
-            https://raw.githubusercontent.com/vrtmrz/obsidian-livesync/2c2b9c90e4e10a454f2838c63ba656c0e67a374c/utils/setup/generate_setup_uri.ts)"
-          grep -Fq 'obsidian://setuplivesync?' <<< "${output}"
+          test_dir="$(mktemp -d)"
+          trap 'rm -rf "${test_dir}"' EXIT
+          cat > "${test_dir}/.env" <<'EOF'
+          PUBLIC_URL=https://127.0.0.1:23456
+          COUCHDB_DATABASE=obsidiannotes
+          COUCHDB_USER=test_user
+          COUCHDB_PASSWORD=0123456789abcdef0123456789abcdef
+          VAULT_PASSPHRASE=11111111111111111111111111111111
+          SETUP_URI_PASSPHRASE=22222222222222222222222222222222
+          EOF
+          ZOE_INSTALL_DIR="${test_dir}" bash scripts/generate-setup-uri.sh >/dev/null
+          uri="$(cat "${test_dir}/setup-uri-only.txt")"
+          [[ "${uri}" == "obsidian://setuplivesync?settings=%5B"*"%5D" ]]
+          [[ "$(wc -l < "${test_dir}/setup-uri-only.txt")" -eq 1 ]]
+          grep -Fq "${uri}" "${test_dir}/setup-uri.txt"
+          grep -Fq 'Setup URI 保护口令: 22222222222222222222222222222222' "${test_dir}/setup-uri.txt"

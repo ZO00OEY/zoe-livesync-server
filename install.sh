@@ -636,7 +636,8 @@ main() {
     echo "以上信息另存于："
     echo "  ${INSTALL_DIR}/connection.txt"
     echo "  ${INSTALL_DIR}/setup-uri.txt"
-    echo "两个文件权限均为 600。"
+    echo "  ${INSTALL_DIR}/setup-uri-only.txt（只有完整 URI，可直接全选复制）"
+    echo "三个文件权限均为 600。"
     echo "管理命令：${INSTALL_DIR}/manage.sh status"
 }
 

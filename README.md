@@ -97,7 +97,16 @@ sudo /opt/zoe-livesync-server/manage.sh restart
 sudo /opt/zoe-livesync-server/manage.sh renew
 sudo /opt/zoe-livesync-server/manage.sh config
 sudo /opt/zoe-livesync-server/manage.sh setup-uri
+sudo /opt/zoe-livesync-server/manage.sh uri
 ```
+
+`manage.sh uri` 只输出一行完整的 Setup URI。也可以直接打开：
+
+```text
+/opt/zoe-livesync-server/setup-uri-only.txt
+```
+
+该文件不含标题、说明或保护口令，可以全选后直接粘贴到 Self-hosted LiveSync。脚本会在写出文件前校验 URI 必须从 `obsidian://setuplivesync?settings=%5B` 开始、以 `%5D` 结束，且整行不含空白字符。
 
 ## 端口要求
 
