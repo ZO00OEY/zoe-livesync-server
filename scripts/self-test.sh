@@ -27,9 +27,9 @@ for ip in "${private_cases[@]}"; do
     fi
 done
 
-INSTALL_DIR="${TMPDIR:-/tmp}/zoe-livesync-self-test-missing"
-PUBLIC_IP="8.8.8.8"
-HTTPS_PORT="8443"
+export INSTALL_DIR="${TMPDIR:-/tmp}/zoe-livesync-self-test-missing"
+export PUBLIC_IP="8.8.8.8"
+export HTTPS_PORT="8443"
 port_is_busy() { return 1; }
 select_https_port >/dev/null
 [[ "${PUBLIC_URL}" == "https://8.8.8.8:8443" ]] || {
