@@ -86,10 +86,10 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
     -subj "${cert_subject}" \
     -keyout "${cert_test_dir}/source.key" -out "${cert_test_dir}/source.pem" >/dev/null 2>&1
 INSTALL_DIR="${cert_test_dir}/install"
-PUBLIC_HOST="sync.example.com"
-TLS_CERT_FILE="${cert_test_dir}/source.pem"
-TLS_KEY_FILE="${cert_test_dir}/source.key"
-TLS_MODE="existing"
+export PUBLIC_HOST="sync.example.com"
+export TLS_CERT_FILE="${cert_test_dir}/source.pem"
+export TLS_KEY_FILE="${cert_test_dir}/source.key"
+export TLS_MODE="existing"
 mkdir -p "${INSTALL_DIR}/config" "${INSTALL_DIR}/certs"
 validate_existing_certificate
 install_existing_certificate >/dev/null
