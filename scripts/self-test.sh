@@ -65,6 +65,7 @@ INSTALL_DIR="${port_test_dir}"
 HTTPS_PORT=""
 # shellcheck disable=SC2329
 port_is_busy() { [[ "$1" == "24567" ]]; }
+# shellcheck disable=SC2329
 docker() { return 1; }
 select_https_port >/dev/null 2>&1
 [[ "${HTTPS_PORT}" != "24567" && "${HTTPS_PORT}" -ge 20000 && "${HTTPS_PORT}" -le 29999 ]] || {
@@ -123,6 +124,7 @@ PATH="${lease_test_dir}/bin:${PATH}"
 unset -f docker
 detect_port80_owner
 [[ "${PORT80_OWNER_TYPE}:${PORT80_OWNER_NAME}" == "docker:headscale" ]]
+[[ "${PORT80_OWNER_DISPLAY}" == *headscale* ]]
 PORT80_AUTO_RELEASE=1 PORT80_OWNER_TYPE=docker PORT80_OWNER_NAME=headscale \
     "${root_dir}/scripts/with-port80-released.sh" -- touch "${lease_test_dir}/ran" >/dev/null
 [[ -f "${lease_test_dir}/ran" && "$(cat "${lease_test_dir}/state")" == running ]]
