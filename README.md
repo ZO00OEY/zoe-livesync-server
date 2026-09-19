@@ -15,6 +15,7 @@
 - 候选 IP 不一致时明确警告，由用户确认，不静默猜测。
 - 使用 `acme.sh` 和 Let's Encrypt `shortlived` profile 签发公网 IP 证书。
 - 默认从 `20000-29999` 随机选择一个未占用的独立 HTTPS 端口，并在安装结束时醒目显示。
+- 检测到已启用的 UFW 或 firewalld 时，自动、持久放行 TCP 80 和最终选中的 HTTPS 端口。
 - 不停止、不改写、不接管服务器上已有的代理节点。
 - 每 12 小时检查证书续期；证书更新后自动重载本项目自己的 Caddy。
 - CouchDB 仅绑定 `127.0.0.1:5984`，不会把数据库原始端口暴露到公网。
@@ -45,6 +46,12 @@ sudo PUBLIC_IP=你的公网IP HTTPS_PORT=8443 bash install.sh
 
 ```bash
 sudo PUBLIC_IP=你的公网IP HTTPS_PORT=8443 NON_INTERACTIVE=1 bash install.sh --non-interactive
+```
+
+如需由你自己管理主机防火墙，可明确跳过自动配置：
+
+```bash
+sudo FIREWALL_MODE=skip bash install.sh
 ```
 
 ## 只检查公网 IP
@@ -98,6 +105,15 @@ sudo /opt/zoe-livesync-server/manage.sh setup-uri
 - TCP 20000-29999 中最终选中的一个端口：本项目独立的 HTTPS 服务端口。
 - TCP 5984：仅监听服务器回环地址，不应在云安全组中开放。
 
+脚本只处理服务器操作系统内部的防火墙：
+
+- UFW 已启用：自动添加 TCP 80 和随机 HTTPS 端口规则。
+- firewalld 已运行：向当前活动区域同时添加即时规则和永久规则。
+- UFW/firewalld 未启用：不会擅自安装或开启防火墙。
+- 检测到自定义 nftables/iptables 默认拒绝入站：只给出警告，不直接改写规则，以免影响已有代理或其他服务。
+
+云厂商控制台中的“安全组”在服务器外部，通用脚本没有云账号 API 权限，无法自动修改。仍需在云服务商控制台确认 TCP 80 和最终选中的 HTTPS 端口已放行；TCP 5984 不要放行。
+
 如果 TCP 80 当前被其他服务长期占用，脚本会停止证书申请并显示占用信息，不会停止原服务。后续会增加与其他入口共用 HTTP-01 验证目录的可选模式。
 
 ## 与已有代理节点共存
@@ -120,7 +136,7 @@ Obsidian LiveSync → https://服务器IP:随机端口
 
 - 第一版只处理 Server A（CouchDB 同步端）。Server C 发布端将在后续模块实现。
 - 第一版自动证书流程只支持公网 IPv4。
-- 云服务器安全组需要放行最终选择的 HTTPS 端口。
+- 云服务器安全组需要放行 TCP 80 和最终选择的 HTTPS 端口。
 - IP 变化后，证书和客户端连接地址需要重新生成。
 - 端到端加密口令由用户在 Self-hosted LiveSync 中另行设置并保管。
 

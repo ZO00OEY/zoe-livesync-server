@@ -11,7 +11,9 @@ PUBLIC_IP="${PUBLIC_IP:-}"
 COUCHDB_USER="${COUCHDB_USER:-obsidian_user}"
 COUCHDB_DATABASE="${COUCHDB_DATABASE:-obsidiannotes}"
 HTTPS_PORT="${HTTPS_PORT:-}"
+FIREWALL_MODE="${FIREWALL_MODE:-auto}"
 PUBLIC_URL=""
+HOST_FIREWALL_STATUS="尚未检查"
 VAULT_PASSPHRASE="${VAULT_PASSPHRASE:-}"
 SETUP_URI_PASSPHRASE="${SETUP_URI_PASSPHRASE:-}"
 
@@ -321,6 +323,62 @@ select_https_port() {
     info "已选定独立随机 HTTPS 端口：${HTTPS_PORT}"
 }
 
+custom_firewall_is_restrictive() {
+    local input_policy=""
+
+    if command_exists nft && nft list ruleset 2>/dev/null | grep -Eiq 'hook[[:space:]]+input.*policy[[:space:]]+(drop|reject)'; then
+        return 0
+    fi
+    if command_exists iptables; then
+        input_policy="$(iptables -S INPUT 2>/dev/null | head -n 1 || true)"
+        [[ "${input_policy}" == "-P INPUT DROP" || "${input_policy}" == "-P INPUT REJECT" ]] && return 0
+    fi
+    return 1
+}
+
+configure_host_firewall() {
+    local port zone
+
+    case "${FIREWALL_MODE}" in
+        auto) ;;
+        skip)
+            HOST_FIREWALL_STATUS="已按 FIREWALL_MODE=skip 跳过自动配置"
+            warn "已跳过主机防火墙配置；请自行确认 TCP 80 和 TCP ${HTTPS_PORT} 可入站。"
+            return
+            ;;
+        *) die "FIREWALL_MODE 只能是 auto 或 skip。" ;;
+    esac
+
+    if command_exists ufw && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
+        for port in 80 "${HTTPS_PORT}"; do
+            ufw allow "${port}/tcp" >/dev/null || die "UFW 放行 TCP ${port} 失败。"
+        done
+        HOST_FIREWALL_STATUS="UFW 已自动放行 TCP 80 和 TCP ${HTTPS_PORT}"
+        ok "${HOST_FIREWALL_STATUS}。"
+        return
+    fi
+
+    if command_exists firewall-cmd && firewall-cmd --state 2>/dev/null | grep -qx 'running'; then
+        zone="$(firewall-cmd --get-active-zones 2>/dev/null | awk 'NF && $1 !~ /^(interfaces:|sources:)$/ {print $1; exit}')"
+        [[ -n "${zone}" ]] || zone="$(firewall-cmd --get-default-zone)"
+        for port in 80 "${HTTPS_PORT}"; do
+            firewall-cmd --zone="${zone}" --add-port="${port}/tcp" >/dev/null || die "firewalld 临时放行 TCP ${port} 失败。"
+            firewall-cmd --permanent --zone="${zone}" --add-port="${port}/tcp" >/dev/null || die "firewalld 永久放行 TCP ${port} 失败。"
+        done
+        HOST_FIREWALL_STATUS="firewalld 区域 ${zone} 已自动放行 TCP 80 和 TCP ${HTTPS_PORT}"
+        ok "${HOST_FIREWALL_STATUS}。"
+        return
+    fi
+
+    if custom_firewall_is_restrictive; then
+        HOST_FIREWALL_STATUS="检测到自定义 nftables/iptables 入站限制，未自动修改"
+        warn "${HOST_FIREWALL_STATUS}；请手动放行 TCP 80 和 TCP ${HTTPS_PORT}。"
+    else
+        HOST_FIREWALL_STATUS="未检测到启用中的 UFW/firewalld；未新增主机防火墙规则"
+        info "${HOST_FIREWALL_STATUS}。"
+    fi
+}
+
 prepare_files() {
     mkdir -p "${INSTALL_DIR}"/{config,scripts,certs}
     install -m 0644 "${SOURCE_DIR}/compose.yaml" "${INSTALL_DIR}/compose.yaml"
@@ -479,7 +537,9 @@ HTTPS 端口: ${HTTPS_PORT}
 密码: ${COUCHDB_PASSWORD}
 数据库: ${COUCHDB_DATABASE}
 
-服务器提醒: 请在云服务商安全组中放行 TCP ${HTTPS_PORT} 端口。
+主机防火墙: ${HOST_FIREWALL_STATUS}
+云安全组: 通用服务器脚本无法修改，请确认 TCP 80 和 TCP ${HTTPS_PORT} 已放行。
+端口说明: TCP 80 用于首次签发及自动续期 IP 证书；TCP ${HTTPS_PORT} 用于 LiveSync HTTPS 连接。
 
 注意：首次设备请使用一个单独保存的端到端加密口令；它不是上面的 CouchDB 密码。
 EOF
@@ -502,6 +562,7 @@ usage() {
 环境变量：
   PUBLIC_IP          明确指定公网 IPv4
   HTTPS_PORT         可选；不指定时随机选择 20000-29999 中的空闲端口
+  FIREWALL_MODE      主机防火墙处理方式：auto（默认）或 skip
   COUCHDB_USER       CouchDB 用户名，默认 obsidian_user
   COUCHDB_PASSWORD   CouchDB 密码；不指定则随机生成
   COUCHDB_DATABASE   数据库名，默认 obsidiannotes
@@ -548,6 +609,7 @@ main() {
     ensure_docker
     choose_ip_candidate
     select_https_port
+    configure_host_firewall
 
     prepare_files
     compose up -d couchdb couchdb-init
