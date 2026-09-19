@@ -34,7 +34,11 @@ certificate_matches_key() {
 sync_existing_certificate() {
     [[ -r "${TLS_CERT_FILE}" && -r "${TLS_KEY_FILE}" ]]
     openssl x509 -checkend 86400 -noout -in "${TLS_CERT_FILE}"
-    openssl x509 -checkhost "${PUBLIC_HOST}" -noout -in "${TLS_CERT_FILE}" >/dev/null
+    if [[ "${PUBLIC_HOST}" == "${PUBLIC_IP}" ]]; then
+        openssl x509 -checkip "${PUBLIC_HOST}" -noout -in "${TLS_CERT_FILE}" >/dev/null
+    else
+        openssl x509 -checkhost "${PUBLIC_HOST}" -noout -in "${TLS_CERT_FILE}" >/dev/null
+    fi
     certificate_matches_key "${TLS_CERT_FILE}" "${TLS_KEY_FILE}"
     if ! cmp -s "${TLS_CERT_FILE}" "${install_dir}/certs/fullchain.cer" || \
        ! cmp -s "${TLS_KEY_FILE}" "${install_dir}/certs/tls.key"; then
@@ -49,10 +53,8 @@ renew_ip_certificate() {
         return
     fi
     if ss -H -ltnp 'sport = :80' 2>/dev/null | grep -q .; then
-        env PORT80_AUTO_RELEASE="${PORT80_AUTO_RELEASE:-0}" PORT80_OWNER_TYPE="${PORT80_OWNER_TYPE:-}" \
-            PORT80_OWNER_NAME="${PORT80_OWNER_NAME:-}" \
-            "${install_dir}/scripts/with-port80-released.sh" -- \
-            "${acme_home}/acme.sh" --cron --home "${acme_home}"
+        echo "公网 IP 证书需要续签，但 TCP 80 当前被其他服务占用；未停止该服务。" >&2
+        return 1
     else
         "${acme_home}/acme.sh" --cron --home "${acme_home}"
     fi

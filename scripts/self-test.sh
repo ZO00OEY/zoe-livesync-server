@@ -6,7 +6,6 @@ root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bash -n "${root_dir}/install.sh"
 bash -n "${root_dir}/manage.sh"
 bash -n "${root_dir}/scripts/generate-setup-uri.sh"
-bash -n "${root_dir}/scripts/with-port80-released.sh"
 
 # shellcheck disable=SC1091
 source "${root_dir}/install.sh" --source-only
@@ -93,6 +92,8 @@ export TLS_CERT_FILE="${cert_test_dir}/source.pem"
 export TLS_KEY_FILE="${cert_test_dir}/source.key"
 export TLS_MODE="existing"
 mkdir -p "${INSTALL_DIR}/config" "${INSTALL_DIR}/certs"
+# shellcheck disable=SC2329
+hostname_points_here() { return 0; }
 validate_existing_certificate
 install_existing_certificate >/dev/null
 write_https_caddyfile
@@ -101,40 +102,26 @@ grep -Fq 'tls /certs/fullchain.cer /certs/tls.key' "${INSTALL_DIR}/config/Caddyf
 certificate_matches_key "${INSTALL_DIR}/certs/fullchain.cer" "${INSTALL_DIR}/certs/tls.key"
 rm -rf "${cert_test_dir}"
 
-lease_test_dir="$(mktemp -d)"
-mkdir -p "${lease_test_dir}/bin"
-printf 'running\n' > "${lease_test_dir}/state"
-cat > "${lease_test_dir}/bin/ss" <<EOF
-#!/usr/bin/env bash
-[[ "\$(cat '${lease_test_dir}/state')" == running ]] && printf 'LISTEN docker-proxy pid=123\n'
+ip_cert_dir="$(mktemp -d)"
+cat > "${ip_cert_dir}/openssl.cnf" <<'EOF'
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = 8.8.8.8
+[ext]
+subjectAltName = IP:8.8.8.8
 EOF
-cat > "${lease_test_dir}/bin/docker" <<EOF
-#!/usr/bin/env bash
-case "\$1" in
-  ps) [[ "\$(cat '${lease_test_dir}/state')" == running ]] && printf 'headscale\n' ;;
-  inspect) printf 'headscale/headscale:test\n' ;;
-  stop) printf 'stopped\n' > '${lease_test_dir}/state' ;;
-  start) printf 'running\n' > '${lease_test_dir}/state' ;;
-esac
-EOF
-chmod +x "${lease_test_dir}/bin/ss" "${lease_test_dir}/bin/docker"
-PORT80_OWNER_TYPE="" PORT80_OWNER_NAME="" PORT80_OWNER_DISPLAY=""
-original_path="${PATH}"
-PATH="${lease_test_dir}/bin:${PATH}"
-unset -f docker
-detect_port80_owner
-[[ "${PORT80_OWNER_TYPE}:${PORT80_OWNER_NAME}" == "docker:headscale" ]]
-[[ "${PORT80_OWNER_DISPLAY}" == *headscale* ]]
-PORT80_AUTO_RELEASE=1 PORT80_OWNER_TYPE=docker PORT80_OWNER_NAME=headscale \
-    "${root_dir}/scripts/with-port80-released.sh" -- touch "${lease_test_dir}/ran" >/dev/null
-[[ -f "${lease_test_dir}/ran" && "$(cat "${lease_test_dir}/state")" == running ]]
-if PORT80_AUTO_RELEASE=1 PORT80_OWNER_TYPE=docker PORT80_OWNER_NAME=headscale \
-    "${root_dir}/scripts/with-port80-released.sh" -- false >/dev/null 2>&1; then
-    echo "A failed certificate command should remain failed" >&2
-    exit 1
-fi
-[[ "$(cat "${lease_test_dir}/state")" == running ]]
-PATH="${original_path}"
-rm -rf "${lease_test_dir}"
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+    -config "${ip_cert_dir}/openssl.cnf" \
+    -keyout "${ip_cert_dir}/source.key" -out "${ip_cert_dir}/source.pem" >/dev/null 2>&1
+export PUBLIC_IP="8.8.8.8"
+export PUBLIC_HOST="8.8.8.8"
+export TLS_CERT_FILE="${ip_cert_dir}/source.pem"
+export TLS_KEY_FILE="${ip_cert_dir}/source.key"
+validate_existing_certificate
+certificate_covers_public_host "${TLS_CERT_FILE}"
+rm -rf "${ip_cert_dir}"
 
 echo "Self-test passed."

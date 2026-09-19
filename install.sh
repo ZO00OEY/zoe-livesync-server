@@ -16,10 +16,6 @@ TLS_MODE="${TLS_MODE:-auto}"
 PUBLIC_HOST="${PUBLIC_HOST:-}"
 TLS_CERT_FILE="${TLS_CERT_FILE:-}"
 TLS_KEY_FILE="${TLS_KEY_FILE:-}"
-PORT80_AUTO_RELEASE="${PORT80_AUTO_RELEASE:-0}"
-PORT80_OWNER_TYPE="${PORT80_OWNER_TYPE:-}"
-PORT80_OWNER_NAME="${PORT80_OWNER_NAME:-}"
-PORT80_OWNER_DISPLAY=""
 PUBLIC_URL=""
 HOST_FIREWALL_STATUS="尚未检查"
 VAULT_PASSPHRASE="${VAULT_PASSPHRASE:-}"
@@ -388,14 +384,30 @@ certificate_matches_key() {
     [[ -n "${cert_hash}" && "${cert_hash}" == "${key_hash}" ]]
 }
 
+certificate_covers_public_host() {
+    if valid_ipv4 "${PUBLIC_HOST}"; then
+        openssl x509 -checkip "${PUBLIC_HOST}" -noout -in "$1" >/dev/null 2>&1
+    else
+        openssl x509 -checkhost "${PUBLIC_HOST}" -noout -in "$1" >/dev/null 2>&1
+    fi
+}
+
+public_host_points_here() {
+    if valid_ipv4 "${PUBLIC_HOST}"; then
+        is_public_ipv4 "${PUBLIC_HOST}" && [[ "${PUBLIC_HOST}" == "${PUBLIC_IP}" ]]
+    else
+        valid_hostname "${PUBLIC_HOST}" && hostname_points_here "${PUBLIC_HOST}"
+    fi
+}
+
 validate_existing_certificate() {
     [[ "${TLS_CERT_FILE}" =~ ^/[A-Za-z0-9._/+:-]+$ ]] || die "TLS_CERT_FILE 必须是无空格的安全绝对路径。"
     [[ "${TLS_KEY_FILE}" =~ ^/[A-Za-z0-9._/+:-]+$ ]] || die "TLS_KEY_FILE 必须是无空格的安全绝对路径。"
     [[ -r "${TLS_CERT_FILE}" ]] || die "证书文件不可读：${TLS_CERT_FILE}"
     [[ -r "${TLS_KEY_FILE}" ]] || die "私钥文件不可读：${TLS_KEY_FILE}"
-    valid_hostname "${PUBLIC_HOST}" || die "PUBLIC_HOST 不是有效域名：${PUBLIC_HOST}"
+    public_host_points_here || die "PUBLIC_HOST 必须是当前公网 IP，或解析到该 IP 的有效域名：${PUBLIC_HOST}"
     openssl x509 -checkend 86400 -noout -in "${TLS_CERT_FILE}" >/dev/null 2>&1 || die "现有证书无效或将在 24 小时内过期。"
-    openssl x509 -checkhost "${PUBLIC_HOST}" -noout -in "${TLS_CERT_FILE}" >/dev/null 2>&1 || die "现有证书不包含域名 ${PUBLIC_HOST}。"
+    certificate_covers_public_host "${TLS_CERT_FILE}" || die "现有证书不包含 ${PUBLIC_HOST}。"
     certificate_matches_key "${TLS_CERT_FILE}" "${TLS_KEY_FILE}" || die "现有证书与私钥不匹配。"
 }
 
@@ -404,7 +416,7 @@ hostname_points_here() {
 }
 
 discover_existing_certificate() {
-    local peer_cert peer_hash file file_hash host key root container_id source destination sni_host
+    local peer_cert peer_hash file file_hash identity key root container_id source destination sni_host
     local -a roots=() cert_files=() key_files=()
     peer_cert="$(mktemp)"
     sni_host="$(hostname -f 2>/dev/null || true)"
@@ -448,87 +460,35 @@ discover_existing_certificate() {
     for file in "${cert_files[@]}"; do
         file_hash="$(openssl x509 -in "${file}" -outform DER 2>/dev/null | sha256sum | awk '{print $1}' || true)"
         [[ "${file_hash}" == "${peer_hash}" ]] || continue
-        while read -r host; do
-            host="${host#DNS:}"
-            [[ "${host}" == \** ]] && continue
-            valid_hostname "${host}" || continue
-            hostname_points_here "${host}" || continue
-            curl --noproxy '*' --resolve "${host}:443:127.0.0.1" -sS --connect-timeout 5 --max-time 10 \
-                -o /dev/null "https://${host}/" 2>/dev/null || continue
+        while read -r identity; do
+            PUBLIC_HOST="${identity#DNS:}"
+            PUBLIC_HOST="${PUBLIC_HOST#IP Address:}"
+            [[ "${PUBLIC_HOST}" == \** ]] && continue
+            public_host_points_here || continue
+            certificate_covers_public_host "${file}" || continue
+            curl --noproxy '*' --resolve "${PUBLIC_HOST}:443:127.0.0.1" -sS --connect-timeout 5 --max-time 10 \
+                -o /dev/null "https://${PUBLIC_HOST}/" 2>/dev/null || continue
             for key in "${key_files[@]}"; do
                 if certificate_matches_key "${file}" "${key}"; then
-                    PUBLIC_HOST="${host}"
                     TLS_CERT_FILE="${file}"
                     TLS_KEY_FILE="${key}"
                     rm -f "${peer_cert}"
                     return 0
                 fi
             done
-        done < <(openssl x509 -in "${file}" -noout -ext subjectAltName 2>/dev/null | grep -oE 'DNS:[^, ]+' || true)
+        done < <(openssl x509 -in "${file}" -noout -ext subjectAltName 2>/dev/null | grep -oE 'DNS:[^, ]+|IP Address:[^, ]+' || true)
     done
     rm -f "${peer_cert}"
     return 1
 }
 
-detect_port80_owner() {
-    local pid unit image
-    local -a containers=() units=()
-    mapfile -t containers < <(docker ps --filter publish=80 --format '{{.Names}}' 2>/dev/null | sort -u)
-    if ((${#containers[@]} == 1)); then
-        PORT80_OWNER_TYPE="docker"
-        PORT80_OWNER_NAME="${containers[0]}"
-        image="$(docker inspect "${PORT80_OWNER_NAME}" --format '{{.Config.Image}}' 2>/dev/null || true)"
-        PORT80_OWNER_DISPLAY="Docker 容器 ${PORT80_OWNER_NAME}${image:+（${image}）}"
-        return 0
-    fi
-    while read -r pid; do
-        unit="$(sed -n 's|.*/\([^/]*\.service\)$|\1|p' "/proc/${pid}/cgroup" 2>/dev/null | head -n 1)"
-        [[ -n "${unit}" ]] && units+=("${unit}")
-    done < <(ss -H -ltnp 'sport = :80' 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
-    if ((${#units[@]} > 0)); then
-        mapfile -t units < <(printf '%s\n' "${units[@]}" | sort -u)
-    fi
-    if ((${#units[@]} == 1)) && systemctl is-active --quiet "${units[0]}"; then
-        PORT80_OWNER_TYPE="systemd"
-        PORT80_OWNER_NAME="${units[0]}"
-        PORT80_OWNER_DISPLAY="systemd 服务 ${PORT80_OWNER_NAME}"
-        return 0
-    fi
-    PORT80_OWNER_DISPLAY="$(ss -H -ltnp 'sport = :80' 2>/dev/null | head -n 1)"
-    return 1
-}
-
-confirm_port80_release() {
-    local answer
-    if [[ "${NON_INTERACTIVE}" == "1" ]]; then
-        [[ "${PORT80_AUTO_RELEASE}" == "1" && -n "${PORT80_OWNER_TYPE}" && -n "${PORT80_OWNER_NAME}" ]] || \
-            die "非交互模式不会停止 80 端口服务；需预先明确 PORT80_AUTO_RELEASE=1、PORT80_OWNER_TYPE 和 PORT80_OWNER_NAME。"
-        return
-    fi
-    printf '%b[危险]%b 当前 80 端口被 %s 占用，是否强制关闭？\n' "${red}" "${reset}" "${PORT80_OWNER_DISPLAY}" >&2
-    printf '脚本只会在证书验证期间临时停止，并在成功、失败或中断后自动恢复。输入 YES 继续：'
-    read -r answer
-    [[ "${answer}" == "YES" ]] || die "已取消安装，未停止任何现有服务。"
-    PORT80_AUTO_RELEASE=1
-}
-
 select_tls_mode() {
     local answer stored_mode="" stored_host="" stored_cert="" stored_key=""
-    local stored_release="" stored_owner_type="" stored_owner_name=""
-    local expected_owner_type="" expected_owner_name=""
     if [[ -f "${INSTALL_DIR}/.env" ]]; then
         stored_mode="$(sed -n 's/^TLS_MODE=//p' "${INSTALL_DIR}/.env" | head -n 1)"
         stored_host="$(sed -n 's/^PUBLIC_HOST=//p' "${INSTALL_DIR}/.env" | head -n 1)"
         stored_cert="$(sed -n 's/^TLS_CERT_FILE=//p' "${INSTALL_DIR}/.env" | head -n 1)"
         stored_key="$(sed -n 's/^TLS_KEY_FILE=//p' "${INSTALL_DIR}/.env" | head -n 1)"
-        stored_release="$(sed -n 's/^PORT80_AUTO_RELEASE=//p' "${INSTALL_DIR}/.env" | head -n 1)"
-        stored_owner_type="$(sed -n 's/^PORT80_OWNER_TYPE=//p' "${INSTALL_DIR}/.env" | head -n 1)"
-        stored_owner_name="$(sed -n 's/^PORT80_OWNER_NAME=//p' "${INSTALL_DIR}/.env" | head -n 1)"
-    fi
-    if [[ -z "${PORT80_OWNER_TYPE}" && "${stored_release}" == "1" ]]; then
-        PORT80_AUTO_RELEASE="${stored_release}"
-        PORT80_OWNER_TYPE="${stored_owner_type}"
-        PORT80_OWNER_NAME="${stored_owner_name}"
     fi
     if [[ "${TLS_MODE}" == "auto" && "${stored_mode}" == "existing" && -n "${stored_host}" ]]; then
         TLS_MODE="existing"; PUBLIC_HOST="${stored_host}"; TLS_CERT_FILE="${stored_cert}"; TLS_KEY_FILE="${stored_key}"
@@ -559,24 +519,8 @@ select_tls_mode() {
                 TLS_MODE="existing"
                 validate_existing_certificate
             elif port_is_busy 80; then
-                expected_owner_type="${PORT80_OWNER_TYPE}"
-                expected_owner_name="${PORT80_OWNER_NAME}"
-                if detect_port80_owner; then
-                    if [[ "${PORT80_AUTO_RELEASE}" == "1" && -n "${expected_owner_type}" ]] && \
-                       [[ "${expected_owner_type}:${expected_owner_name}" != "${PORT80_OWNER_TYPE}:${PORT80_OWNER_NAME}" ]]; then
-                        if [[ "${NON_INTERACTIVE}" == "1" ]]; then
-                            die "80 端口占用者已从 ${expected_owner_type}:${expected_owner_name} 变为 ${PORT80_OWNER_TYPE}:${PORT80_OWNER_NAME}，拒绝使用旧授权。"
-                        fi
-                        warn "80 端口占用者与上次授权对象不同，将重新征求确认。"
-                        PORT80_AUTO_RELEASE=0
-                    fi
-                    confirm_port80_release
-                    TLS_MODE="ip"
-                    PUBLIC_HOST="${PUBLIC_IP}"
-                else
-                    printf '%b[危险]%b 当前 80 端口被以下进程占用：%s\n' "${red}" "${reset}" "${PORT80_OWNER_DISPLAY}" >&2
-                    die "无法确认它属于可自动恢复的 Docker 容器或 systemd 服务，因此拒绝直接结束进程。"
-                fi
+                ss -H -ltnp 'sport = :80' 2>/dev/null >&2 || true
+                die "80 端口已被占用，且没有找到可安全复用的证书与私钥；脚本不会停止现有服务。"
             else
                 TLS_MODE="ip"
                 PUBLIC_HOST="${PUBLIC_IP}"
@@ -590,7 +534,7 @@ select_tls_mode() {
     else
         PUBLIC_URL="https://${PUBLIC_HOST}:${HTTPS_PORT}"
     fi
-    ok "HTTPS 模式：$([[ "${TLS_MODE}" == "existing" ]] && printf '复用现有域名证书' || printf '公网 IP 证书')；访问地址 ${PUBLIC_URL}"
+    ok "HTTPS 模式：$([[ "${TLS_MODE}" == "existing" ]] && printf '复用现有证书' || printf '新签发公网 IP 证书')；访问地址 ${PUBLIC_URL}"
 }
 
 check_local_service_ports() {
@@ -670,13 +614,11 @@ prepare_files() {
     install -m 0644 "${SOURCE_DIR}/config/livesync.ini" "${INSTALL_DIR}/config/livesync.ini"
     install -m 0644 "${SOURCE_DIR}/scripts/provision-couchdb.ts" "${INSTALL_DIR}/scripts/provision-couchdb.ts"
     install -m 0755 "${SOURCE_DIR}/scripts/generate-setup-uri.sh" "${INSTALL_DIR}/scripts/generate-setup-uri.sh"
-    install -m 0755 "${SOURCE_DIR}/scripts/with-port80-released.sh" "${INSTALL_DIR}/scripts/with-port80-released.sh"
     install -m 0644 "${SOURCE_DIR}/scripts/create-setup-uri.ts" "${INSTALL_DIR}/scripts/create-setup-uri.ts"
     install -m 0755 "${SOURCE_DIR}/manage.sh" "${INSTALL_DIR}/manage.sh"
 
     local password="${COUCHDB_PASSWORD:-}" confirmed_ip="${PUBLIC_IP}" confirmed_url="${PUBLIC_URL}" confirmed_port="${HTTPS_PORT}"
     local confirmed_tls_mode="${TLS_MODE}" confirmed_host="${PUBLIC_HOST}" confirmed_cert="${TLS_CERT_FILE}" confirmed_key="${TLS_KEY_FILE}"
-    local confirmed_release="${PORT80_AUTO_RELEASE}" confirmed_owner_type="${PORT80_OWNER_TYPE}" confirmed_owner_name="${PORT80_OWNER_NAME}"
     local requested_vault_passphrase="${VAULT_PASSPHRASE}" requested_uri_passphrase="${SETUP_URI_PASSPHRASE}"
     if [[ -f "${INSTALL_DIR}/.env" ]]; then
         # shellcheck source=/dev/null
@@ -690,9 +632,6 @@ prepare_files() {
     PUBLIC_HOST="${confirmed_host}"
     TLS_CERT_FILE="${confirmed_cert}"
     TLS_KEY_FILE="${confirmed_key}"
-    PORT80_AUTO_RELEASE="${confirmed_release}"
-    PORT80_OWNER_TYPE="${confirmed_owner_type}"
-    PORT80_OWNER_NAME="${confirmed_owner_name}"
     [[ -n "${requested_vault_passphrase}" ]] && VAULT_PASSPHRASE="${requested_vault_passphrase}"
     [[ -n "${requested_uri_passphrase}" ]] && SETUP_URI_PASSPHRASE="${requested_uri_passphrase}"
     [[ -n "${password}" ]] || password="$(openssl rand -hex 32)"
@@ -709,9 +648,6 @@ TLS_MODE=${TLS_MODE}
 PUBLIC_HOST=${PUBLIC_HOST}
 TLS_CERT_FILE=${TLS_CERT_FILE}
 TLS_KEY_FILE=${TLS_KEY_FILE}
-PORT80_AUTO_RELEASE=${PORT80_AUTO_RELEASE}
-PORT80_OWNER_TYPE=${PORT80_OWNER_TYPE}
-PORT80_OWNER_NAME=${PORT80_OWNER_NAME}
 VAULT_PASSPHRASE=${VAULT_PASSPHRASE}
 SETUP_URI_PASSPHRASE=${SETUP_URI_PASSPHRASE}
 EOF
@@ -756,16 +692,6 @@ install_acme() {
     "${ACME_BIN}" --help 2>&1 | grep -q -- '--certificate-profile' || die "acme.sh 版本不支持 IP 短期证书 profile。"
 }
 
-run_with_port80_available() {
-    if port_is_busy 80; then
-        env PORT80_AUTO_RELEASE="${PORT80_AUTO_RELEASE}" PORT80_OWNER_TYPE="${PORT80_OWNER_TYPE}" \
-            PORT80_OWNER_NAME="${PORT80_OWNER_NAME}" \
-            "${INSTALL_DIR}/scripts/with-port80-released.sh" -- "$@"
-    else
-        "$@"
-    fi
-}
-
 issue_certificate() {
     local cert_file="${INSTALL_DIR}/certs/fullchain.cer"
     local key_file="${INSTALL_DIR}/certs/tls.key"
@@ -775,7 +701,11 @@ issue_certificate() {
         ok "现有 IP 证书仍有效，跳过首次签发。"
     else
         info "向 Let's Encrypt 申请短期公网 IP 证书。"
-        run_with_port80_available "${ACME_BIN}" --issue --home "${ACME_HOME}" --server letsencrypt -d "${PUBLIC_IP}" \
+        if port_is_busy 80; then
+            ss -H -ltnp 'sport = :80' 2>/dev/null >&2 || true
+            die "签发公网 IP 证书需要 TCP 80，但该端口已被占用；脚本不会停止现有服务。"
+        fi
+        "${ACME_BIN}" --issue --home "${ACME_HOME}" --server letsencrypt -d "${PUBLIC_IP}" \
             --certificate-profile shortlived --days -1 --standalone --listen-v4 --ecc --force
     fi
     "${ACME_BIN}" --install-cert --home "${ACME_HOME}" -d "${PUBLIC_IP}" --ecc \
@@ -861,9 +791,6 @@ write_connection_file() {
         firewall_note="请确认 TCP 80 和 TCP ${HTTPS_PORT} 已放行。"
         port_note="TCP 80 用于首次签发及自动续期 IP 证书；TCP ${HTTPS_PORT} 用于 LiveSync HTTPS 连接。"
         certificate_note="由 Zoe 管理 Let's Encrypt 公网 IP 短期证书。"
-        if [[ "${PORT80_AUTO_RELEASE}" == "1" ]]; then
-            certificate_note+=" 验证时临时停止并自动恢复 ${PORT80_OWNER_TYPE}:${PORT80_OWNER_NAME}。"
-        fi
     fi
     cat > "${INSTALL_DIR}/connection.txt" <<EOF
 第一部分：CouchDB API 连接信息
@@ -911,12 +838,9 @@ usage() {
   PUBLIC_IP          明确指定公网 IPv4
   HTTPS_PORT         可选；不指定时随机选择 20000-29999 中的空闲端口
   TLS_MODE           auto（默认）、ip 或 existing
-  PUBLIC_HOST        复用证书时使用的域名
+  PUBLIC_HOST        复用证书时使用的域名或公网 IP
   TLS_CERT_FILE      复用证书时的完整证书链绝对路径
   TLS_KEY_FILE       复用证书时的私钥绝对路径
-  PORT80_AUTO_RELEASE 设为 1 时，允许证书验证期间临时停止已确认的 80 端口服务
-  PORT80_OWNER_TYPE  非交互模式明确指定 docker 或 systemd
-  PORT80_OWNER_NAME  非交互模式明确指定容器名或 systemd 单元名
   FIREWALL_MODE      主机防火墙处理方式：auto（默认）或 skip
   COUCHDB_USER       CouchDB 用户名，默认 obsidian_user
   COUCHDB_PASSWORD   CouchDB 密码；不指定则随机生成
@@ -950,9 +874,6 @@ main() {
     [[ "${EUID}" -eq 0 ]] || die "请使用 root 或 sudo 运行。"
     [[ "${COUCHDB_USER}" =~ ^[A-Za-z][A-Za-z0-9_-]{2,31}$ ]] || die "COUCHDB_USER 格式无效。"
     [[ "${COUCHDB_DATABASE}" =~ ^[a-z][a-z0-9_-]{2,63}$ ]] || die "COUCHDB_DATABASE 格式无效。"
-    [[ "${PORT80_AUTO_RELEASE}" == "0" || "${PORT80_AUTO_RELEASE}" == "1" ]] || die "PORT80_AUTO_RELEASE 只能是 0 或 1。"
-    [[ -z "${PORT80_OWNER_TYPE}" || "${PORT80_OWNER_TYPE}" == "docker" || "${PORT80_OWNER_TYPE}" == "systemd" ]] || die "PORT80_OWNER_TYPE 只能是 docker 或 systemd。"
-    [[ -z "${PORT80_OWNER_NAME}" || "${PORT80_OWNER_NAME}" =~ ^[A-Za-z0-9_.@:-]+$ ]] || die "PORT80_OWNER_NAME 格式无效。"
     if [[ -n "${COUCHDB_PASSWORD:-}" ]]; then
         [[ "${COUCHDB_PASSWORD}" =~ ^[A-Za-z0-9._~!@%+=:-]{16,128}$ ]] || die "COUCHDB_PASSWORD 需为 16-128 位安全字符。"
     fi
