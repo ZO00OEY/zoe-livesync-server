@@ -1,6 +1,6 @@
 # Zoe LiveSync Server
 
-为 Obsidian Self-hosted LiveSync 部署 CouchDB、Caddy 和 Let's Encrypt 公网 IP 短期证书。无需购买或填写域名。
+为 Obsidian Self-hosted LiveSync 部署 CouchDB，并根据服务器现状选择独立 IP 证书或接入现有 Caddy。
 
 这是全新实现，参考了 [`ip-ssl-proxy`](https://github.com/ZO00OEY/ip-ssl-proxy) 的 IP 证书流程，以及 Self-hosted LiveSync 官方的 CouchDB 配置方式。
 
@@ -13,8 +13,10 @@
 - 从多个直连公网查询和云厂商元数据收集公网 IPv4 候选。
 - 不显示或接受局域网、CGNAT、回环、文档示例及其他保留地址。
 - 候选 IP 不一致时明确警告，由用户确认，不静默猜测。
-- 使用 `acme.sh` 和 Let's Encrypt `shortlived` profile 签发公网 IP 证书。
-- 每 12 小时检查续期；证书更新后自动重载 Caddy。
+- 空服务器使用 `acme.sh` 和 Let's Encrypt `shortlived` profile 签发公网 IP 证书。
+- 80/443 已由现有 Caddy 使用时，复用现有 HTTPS 入口并增加 `/couchdb/` 路由，不启动第二个 Caddy。
+- 80/443 被其他程序占用时安全退出，不停止或覆盖现有代理节点。
+- 独立模式每 12 小时检查续期；证书更新后自动重载 Caddy。
 - CouchDB 仅绑定 `127.0.0.1:5984`，公网只开放 80/443。
 - 自动配置 Self-hosted LiveSync 所需的 CORS、认证和大小限制。
 - 生成可直接填写到 Self-hosted LiveSync 的连接信息。
@@ -27,7 +29,7 @@ cd zoe-livesync-server
 sudo bash install.sh
 ```
 
-脚本会列出经过过滤的公网 IPv4 候选。直接回车使用建议值，也可以选择其他候选或手动输入公网 IPv4。
+空服务器上，脚本会列出经过过滤的公网 IPv4 候选。已有 Caddy 时会优先读取现有入口，不再申请第二张证书。
 
 如果服务器使用了代理，并且你已经确认实际入站公网 IP：
 
@@ -58,6 +60,7 @@ bash install.sh --detect-ip
 ```text
 Remote type: CouchDB
 URI: https://公网IP
+# 或复用现有入口：https://已有域名/couchdb
 Username: 自动生成/指定的用户名
 Password: 自动生成/指定的密码
 Database: obsidiannotes
@@ -83,11 +86,11 @@ sudo /opt/zoe-livesync-server/manage.sh config
 
 ## 端口要求
 
-- TCP 80：Let's Encrypt HTTP-01 验证及续期。
-- TCP 443：Obsidian / Self-hosted LiveSync 连接。
+- 独立模式需要 TCP 80/443。
+- 现有 Caddy 模式复用已经监听的 80/443，不创建新的端口监听者。
 - 5984：仅监听服务器回环地址，不应在云安全组中开放。
 
-如果 80 或 443 已被其他服务占用，脚本会停止并显示错误，不会杀死或接管已有服务。
+如果 80/443 是现有 Caddy，脚本会尝试复用其 `/couchdb/` 路由；如果是其他服务则停止，不会杀死或接管它。
 
 ## 当前边界
 

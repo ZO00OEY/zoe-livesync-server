@@ -10,6 +10,9 @@ NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
 PUBLIC_IP="${PUBLIC_IP:-}"
 COUCHDB_USER="${COUCHDB_USER:-obsidian_user}"
 COUCHDB_DATABASE="${COUCHDB_DATABASE:-obsidiannotes}"
+EXISTING_HTTPS_ORIGIN="${EXISTING_HTTPS_ORIGIN:-}"
+INGRESS_MODE=""
+PUBLIC_URL=""
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[1;33m'; cyan='\033[0;36m'; reset='\033[0m'
 info() { printf "%b[信息]%b %s\n" "${cyan}" "${reset}" "$*"; }
@@ -277,14 +280,56 @@ compose() {
     fi
 }
 
-foreign_port_owner() {
-    local port="$1"
-    if ss -H -ltnp "sport = :${port}" 2>/dev/null | grep -q .; then
-        if ! docker ps --format '{{.Names}}' | grep -qx 'zoe-livesync-caddy'; then
-            return 0
-        fi
+port_is_busy() {
+    ss -H -ltnp "sport = :$1" 2>/dev/null | grep -q .
+}
+
+detect_existing_origin() {
+    local domain ip
+    if [[ -n "${EXISTING_HTTPS_ORIGIN}" ]]; then
+        [[ "${EXISTING_HTTPS_ORIGIN}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || \
+            die "EXISTING_HTTPS_ORIGIN 必须是 https://域名 或 https://IP。"
+        printf '%s' "${EXISTING_HTTPS_ORIGIN%/}"
+        return
     fi
-    return 1
+
+    domain="$(sed -n 's/^# 域名: //p' /etc/caddy/Caddyfile 2>/dev/null | head -n 1)"
+    if [[ -n "${domain}" ]]; then
+        printf 'https://%s' "${domain}"
+        return
+    fi
+    ip="$(sed -n 's/^# 公网 IP: //p' /etc/caddy/Caddyfile 2>/dev/null | head -n 1)"
+    if is_public_ipv4 "${ip}"; then
+        printf 'https://%s' "${ip}"
+        return
+    fi
+    die "检测到现有 Caddy，但无法判断 HTTPS 入口。请设置 EXISTING_HTTPS_ORIGIN=https://你的域名 后重跑。"
+}
+
+detect_ingress_mode() {
+    local port80_busy=0 port443_busy=0
+    port_is_busy 80 && port80_busy=1
+    port_is_busy 443 && port443_busy=1
+
+    if (( port80_busy == 0 && port443_busy == 0 )); then
+        INGRESS_MODE="standalone"
+        choose_ip_candidate
+        PUBLIC_URL="https://${PUBLIC_IP}"
+        info "入口模式：独立 IP 证书（脚本管理 80/443）。"
+        return
+    fi
+
+    if command_exists caddy && [[ -f /etc/caddy/Caddyfile ]] && \
+       { ! command_exists systemctl || systemctl is-active --quiet caddy 2>/dev/null || pgrep -x caddy >/dev/null 2>&1; }; then
+        INGRESS_MODE="existing-caddy"
+        PUBLIC_URL="$(detect_existing_origin)/couchdb"
+        info "入口模式：接入现有 Caddy，不创建第二个 Caddy，不接管 80/443。"
+        info "LiveSync 地址：${PUBLIC_URL}"
+        return
+    fi
+
+    ss -H -ltnp '( sport = :80 or sport = :443 )' 2>/dev/null >&2 || true
+    die "80/443 已被非 Caddy 服务占用；为避免影响现有代理节点，脚本不会接管端口。"
 }
 
 prepare_files() {
@@ -294,22 +339,64 @@ prepare_files() {
     install -m 0755 "${SOURCE_DIR}/scripts/couchdb-init.sh" "${INSTALL_DIR}/scripts/couchdb-init.sh"
     install -m 0755 "${SOURCE_DIR}/manage.sh" "${INSTALL_DIR}/manage.sh"
 
-    local password="${COUCHDB_PASSWORD:-}" confirmed_ip="${PUBLIC_IP}"
+    local password="${COUCHDB_PASSWORD:-}" confirmed_ip="${PUBLIC_IP}" confirmed_url="${PUBLIC_URL}" confirmed_mode="${INGRESS_MODE}"
     if [[ -f "${INSTALL_DIR}/.env" ]]; then
         # shellcheck source=/dev/null
         source "${INSTALL_DIR}/.env"
         password="${COUCHDB_PASSWORD}"
     fi
     PUBLIC_IP="${confirmed_ip}"
+    PUBLIC_URL="${confirmed_url}"
+    INGRESS_MODE="${confirmed_mode}"
     [[ -n "${password}" ]] || password="$(openssl rand -hex 32)"
     cat > "${INSTALL_DIR}/.env" <<EOF
 COUCHDB_USER=${COUCHDB_USER}
 COUCHDB_PASSWORD=${password}
 COUCHDB_DATABASE=${COUCHDB_DATABASE}
 PUBLIC_IP=${PUBLIC_IP}
+PUBLIC_URL=${PUBLIC_URL}
+INGRESS_MODE=${INGRESS_MODE}
 EOF
     chmod 0600 "${INSTALL_DIR}/.env"
     COUCHDB_PASSWORD="${password}"
+}
+
+integrate_existing_caddy() {
+    local caddyfile="/etc/caddy/Caddyfile"
+    local route_file="/etc/caddy/routes-custom.d/zoe-couchdb.conf"
+    local created=0
+
+    if grep -RqsE 'handle_path[[:space:]]+/couchdb/\*' /etc/caddy 2>/dev/null; then
+        ok "现有 Caddy 已包含 /couchdb/ 路由。"
+        return
+    fi
+
+    if ! grep -q 'routes-custom.d' "${caddyfile}"; then
+        die "现有 Caddy 尚未预留 routes-custom.d 导入点。为避免改坏代理节点，本次不自动改写主 Caddyfile。"
+    fi
+
+    mkdir -p /etc/caddy/routes-custom.d
+    cat > "${route_file}" <<'EOF'
+redir /couchdb /couchdb/ 308
+handle_path /couchdb/* {
+    reverse_proxy 127.0.0.1:5984 {
+        header_up X-Forwarded-Proto https
+        header_up X-Forwarded-For {remote_host}
+        flush_interval -1
+    }
+}
+handle /_session {
+    reverse_proxy 127.0.0.1:5984
+}
+EOF
+    created=1
+    caddy fmt --overwrite "${route_file}" >/dev/null 2>&1 || true
+    if ! caddy validate --config "${caddyfile}" --adapter caddyfile >/dev/null; then
+        (( created == 1 )) && rm -f "${route_file}"
+        die "新增 CouchDB 路由后 Caddy 校验失败，已撤销路由文件。"
+    fi
+    systemctl reload caddy 2>/dev/null || caddy reload --config "${caddyfile}" --adapter caddyfile
+    ok "已把 /couchdb/ 安全接入现有 Caddy。"
 }
 
 write_http_caddyfile() {
@@ -428,7 +515,7 @@ write_connection_file() {
 Zoe LiveSync / Self-hosted LiveSync 连接信息
 
 Remote type: CouchDB
-URI: https://${PUBLIC_IP}
+URI: ${PUBLIC_URL}
 Username: ${COUCHDB_USER}
 Password: ${COUCHDB_PASSWORD}
 Database: ${COUCHDB_DATABASE}
@@ -439,10 +526,12 @@ EOF
 }
 
 verify_installation() {
-    compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+    if [[ "${INGRESS_MODE}" == "standalone" ]]; then
+        compose --profile standalone exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+    fi
     local body
     body="$(curl -fsS --connect-timeout 5 --max-time 15 \
-        --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "https://${PUBLIC_IP}/_up")" || die "公网 HTTPS 验证失败；请检查云安全组和 80/443 端口。"
+        --user "${COUCHDB_USER}:${COUCHDB_PASSWORD}" "${PUBLIC_URL}/_up")" || die "公网 HTTPS 验证失败；请检查现有反向代理路由及云安全组。"
     grep -q '"status":"ok"' <<< "${body}" || die "HTTPS 已响应，但 CouchDB 健康检查内容不正确。"
     ok "HTTPS、证书与 CouchDB 端到端验证通过。"
 }
@@ -452,7 +541,8 @@ usage() {
 用法：sudo bash install.sh [--non-interactive] [--detect-ip]
 
 环境变量：
-  PUBLIC_IP          明确指定公网 IPv4
+  PUBLIC_IP                 独立模式下明确指定公网 IPv4
+  EXISTING_HTTPS_ORIGIN     现有 Caddy 的入口，如 https://example.com
   COUCHDB_USER       CouchDB 用户名，默认 obsidian_user
   COUCHDB_PASSWORD   CouchDB 密码；不指定则随机生成
   COUCHDB_DATABASE   数据库名，默认 obsidiannotes
@@ -475,8 +565,11 @@ main() {
     echo "========================================"
     echo "  ${PROJECT_NAME}"
     echo "========================================"
-    choose_ip_candidate
-    (( detect_only == 1 )) && { printf '%s\n' "${PUBLIC_IP}"; return 0; }
+    if (( detect_only == 1 )); then
+        choose_ip_candidate
+        printf '%s\n' "${PUBLIC_IP}"
+        return 0
+    fi
     [[ "${EUID}" -eq 0 ]] || die "请使用 root 或 sudo 运行。"
     [[ "${COUCHDB_USER}" =~ ^[A-Za-z][A-Za-z0-9_-]{2,31}$ ]] || die "COUCHDB_USER 格式无效。"
     [[ "${COUCHDB_DATABASE}" =~ ^[a-z][a-z0-9_-]{2,63}$ ]] || die "COUCHDB_DATABASE 格式无效。"
@@ -486,20 +579,24 @@ main() {
     detect_system
     install_base_packages
     ensure_docker
-
-    foreign_port_owner 80 && die "端口 80 已被其他服务占用；不会自动停止它。"
-    foreign_port_owner 443 && die "端口 443 已被其他服务占用；不会自动停止它。"
+    detect_ingress_mode
 
     prepare_files
-    write_http_caddyfile
-    compose up -d couchdb couchdb-init caddy
-    wait_for_couchdb
-    install_acme
-    install_renewal_helpers
-    issue_certificate
-    write_https_caddyfile
-    compose up -d
-    compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+    if [[ "${INGRESS_MODE}" == "standalone" ]]; then
+        write_http_caddyfile
+        compose --profile standalone up -d couchdb couchdb-init caddy
+        wait_for_couchdb
+        install_acme
+        install_renewal_helpers
+        issue_certificate
+        write_https_caddyfile
+        compose --profile standalone up -d
+        compose --profile standalone exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+    else
+        compose up -d couchdb couchdb-init
+        wait_for_couchdb
+        integrate_existing_caddy
+    fi
     write_connection_file
     verify_installation
 
