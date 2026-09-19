@@ -106,7 +106,7 @@ sudo /opt/zoe-livesync-server/manage.sh uri
 /opt/zoe-livesync-server/setup-uri-only.txt
 ```
 
-该文件不含标题、说明或保护口令，可以全选后直接粘贴到 Self-hosted LiveSync。脚本会在写出文件前校验 URI 必须从 `obsidian://setuplivesync?settings=%5B` 开始、以 `%5D` 结束，且整行不含空白字符。
+该文件不含标题、说明或保护口令，可以全选后直接粘贴到 Self-hosted LiveSync。脚本会在写出文件前确认 URI 以 `obsidian://setuplivesync?settings=` 开始、整行不含空白字符，并使用同一套官方库反向解密，核对服务器地址、数据库名、用户名、密码、Vault 加密口令及加密状态。加密载荷没有应当硬编码的固定结尾；反向解密校验可以同时发现载荷截断和字段缺失。
 
 ## 端口要求
 

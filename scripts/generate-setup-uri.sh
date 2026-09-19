@@ -2,11 +2,11 @@
 set -euo pipefail
 
 install_dir="${ZOE_INSTALL_DIR:-/opt/zoe-livesync-server}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 env_file="${install_dir}/.env"
 output_file="${install_dir}/setup-uri.txt"
 uri_only_file="${install_dir}/setup-uri-only.txt"
 deno_image="denoland/deno:alpine-2.9.7"
-generator_url="https://raw.githubusercontent.com/vrtmrz/obsidian-livesync/2c2b9c90e4e10a454f2838c63ba656c0e67a374c/utils/setup/generate_setup_uri.ts"
 
 [[ -f "${env_file}" ]] || { echo "未找到 ${env_file}" >&2; exit 1; }
 
@@ -26,25 +26,20 @@ echo "正在生成 Self-hosted LiveSync 快速导入配置..." >&2
 if ! docker image inspect "${deno_image}" >/dev/null 2>&1; then
     docker pull "${deno_image}" >&2
 fi
-if ! generated="$(docker run --rm \
+if ! setup_uri="$(docker run --rm \
+        -v "${script_dir}/create-setup-uri.ts:/app/create-setup-uri.ts:ro" \
         -e "hostname=${PUBLIC_URL}" \
         -e "database=${COUCHDB_DATABASE}" \
         -e "username=${COUCHDB_USER}" \
         -e "password=${COUCHDB_PASSWORD}" \
         -e "passphrase=${VAULT_PASSPHRASE}" \
         -e "uri_passphrase=${SETUP_URI_PASSPHRASE}" \
-        "${deno_image}" run --minimum-dependency-age=0 --allow-env "${generator_url}")"; then
+        "${deno_image}" run --minimum-dependency-age=0 --allow-env /app/create-setup-uri.ts)"; then
     echo "快速导入配置生成失败；CouchDB 服务本身不受影响。" >&2
     exit 1
 fi
 
-uri_count="$(printf '%s\n' "${generated}" | awk '/^obsidian:\/\/setuplivesync\?settings=/{count++} END{print count+0}')"
-setup_uri="$(printf '%s\n' "${generated}" | awk '/^obsidian:\/\/setuplivesync\?settings=/{print; exit}')"
-[[ "${uri_count}" == "1" ]] || { echo "官方生成器没有返回唯一的 Setup URI。" >&2; exit 1; }
-[[ "${setup_uri}" =~ ^obsidian://setuplivesync\?settings=%5B.+%5D$ ]] || {
-    echo "Setup URI 的前缀或编码结尾不完整，已拒绝输出。" >&2
-    exit 1
-}
+[[ "${setup_uri}" == obsidian://setuplivesync\?settings=* ]] || { echo "Setup URI 前缀无效。" >&2; exit 1; }
 [[ ! "${setup_uri}" =~ [[:space:]] ]] || { echo "Setup URI 中出现了意外空白字符。" >&2; exit 1; }
 
 printf '%s\n' "${setup_uri}" > "${uri_only_file}"
@@ -55,7 +50,7 @@ cat > "${output_file}" <<EOF
 Vault 端到端加密口令: ${VAULT_PASSPHRASE}
 Setup URI 保护口令: ${SETUP_URI_PASSPHRASE}
 
-快速导入地址（完整复制下一行，从 obsidian:// 开始，到 %5D 结束）：
+快速导入地址（完整复制下一行，从 obsidian:// 开始，一直复制到该行最后一个字符）：
 ${setup_uri}
 
 使用方法：在 Obsidian 的 Self-hosted LiveSync 中执行 Open setup URI，粘贴上面完整的一行，再输入 Setup URI 保护口令。

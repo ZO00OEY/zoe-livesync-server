@@ -39,7 +39,8 @@ jobs:
           EOF
           ZOE_INSTALL_DIR="${test_dir}" bash scripts/generate-setup-uri.sh >/dev/null
           uri="$(cat "${test_dir}/setup-uri-only.txt")"
-          [[ "${uri}" == "obsidian://setuplivesync?settings=%5B"*"%5D" ]]
+          [[ "${uri}" == "obsidian://setuplivesync?settings="* ]]
+          [[ "${uri}" != *[[:space:]]* ]]
           [[ "$(wc -l < "${test_dir}/setup-uri-only.txt")" -eq 1 ]]
           grep -Fq "${uri}" "${test_dir}/setup-uri.txt"
           grep -Fq 'Setup URI 保护口令: 22222222222222222222222222222222' "${test_dir}/setup-uri.txt"
