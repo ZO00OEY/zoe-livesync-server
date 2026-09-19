@@ -30,6 +30,7 @@ done
 export INSTALL_DIR="${TMPDIR:-/tmp}/zoe-livesync-self-test-missing"
 export PUBLIC_IP="8.8.8.8"
 export HTTPS_PORT="8443"
+# shellcheck disable=SC2329
 port_is_busy() { return 1; }
 select_https_port >/dev/null
 [[ "${PUBLIC_URL}" == "https://8.8.8.8:8443" ]] || {
@@ -43,6 +44,7 @@ port_test_dir="$(mktemp -d)"
 printf '%s\n' 'HTTPS_PORT=24567' > "${port_test_dir}/.env"
 INSTALL_DIR="${port_test_dir}"
 HTTPS_PORT=""
+# shellcheck disable=SC2329
 port_is_busy() { [[ "$1" == "24567" ]]; }
 docker() { return 1; }
 select_https_port >/dev/null 2>&1
