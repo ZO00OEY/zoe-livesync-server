@@ -44,9 +44,14 @@ case "${1:-status}" in
         ;;
     config)
         cat "${install_dir}/connection.txt"
+        echo
+        cat "${install_dir}/setup-uri.txt"
+        ;;
+    setup-uri)
+        "${install_dir}/scripts/generate-setup-uri.sh"
         ;;
     *)
-        echo "用法: $0 {status|logs [service]|restart|renew|config}" >&2
+        echo "用法: $0 {status|logs [service]|restart|renew|config|setup-uri}" >&2
         exit 2
         ;;
 esac

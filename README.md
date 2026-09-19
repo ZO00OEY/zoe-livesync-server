@@ -14,7 +14,7 @@
 - 不显示或接受局域网、CGNAT、回环、文档示例及其他保留地址。
 - 候选 IP 不一致时明确警告，由用户确认，不静默猜测。
 - 使用 `acme.sh` 和 Let's Encrypt `shortlived` profile 签发公网 IP 证书。
-- 自动选择独立 HTTPS 端口：优先 443；已占用时依次尝试 8443、9443、10443。
+- 默认从 `20000-29999` 随机选择一个未占用的独立 HTTPS 端口，并在安装结束时醒目显示。
 - 不停止、不改写、不接管服务器上已有的代理节点。
 - 每 12 小时检查证书续期；证书更新后自动重载本项目自己的 Caddy。
 - CouchDB 仅绑定 `127.0.0.1:5984`，不会把数据库原始端口暴露到公网。
@@ -29,10 +29,10 @@ cd zoe-livesync-server
 sudo bash install.sh
 ```
 
-脚本会确认公网 IPv4，并自动选择不冲突的 HTTPS 端口。例如服务器的 443 已被代理节点使用时，通常会得到：
+脚本会确认公网 IPv4，并随机选择不冲突的 HTTPS 端口，例如：
 
 ```text
-https://公网IP:8443
+https://公网IP:随机端口
 ```
 
 如果需要明确指定：
@@ -59,11 +59,19 @@ bash install.sh --detect-ip
 
 ```text
 Remote type: CouchDB
-URI: https://公网IP:独立端口
+API 类型: CouchDB
+API URL: https://公网IP:随机端口
+HTTPS 端口: 随机端口
 Username: 自动生成或指定的用户名
 Password: 自动生成或指定的密码
 Database: obsidiannotes
 ```
+
+随后还会生成：
+
+- Vault 端到端加密口令。
+- Setup URI 保护口令。
+- `obsidian://setuplivesync?...` 快速导入地址。
 
 完整信息保存在：
 
@@ -81,12 +89,13 @@ sudo /opt/zoe-livesync-server/manage.sh logs
 sudo /opt/zoe-livesync-server/manage.sh restart
 sudo /opt/zoe-livesync-server/manage.sh renew
 sudo /opt/zoe-livesync-server/manage.sh config
+sudo /opt/zoe-livesync-server/manage.sh setup-uri
 ```
 
 ## 端口要求
 
 - TCP 80：只在申请和续期 IP 证书时临时使用，不会常驻监听，但届时必须允许公网访问。
-- TCP 443、8443、9443 或 10443：本项目独立的 HTTPS 服务端口。
+- TCP 20000-29999 中最终选中的一个端口：本项目独立的 HTTPS 服务端口。
 - TCP 5984：仅监听服务器回环地址，不应在云安全组中开放。
 
 如果 TCP 80 当前被其他服务长期占用，脚本会停止证书申请并显示占用信息，不会停止原服务。后续会增加与其他入口共用 HTTP-01 验证目录的可选模式。
@@ -102,7 +111,7 @@ sudo /opt/zoe-livesync-server/manage.sh config
 本项目会选择另一个端口：
 
 ```text
-Obsidian LiveSync → https://服务器IP:8443
+Obsidian LiveSync → https://服务器IP:随机端口
 ```
 
 两套服务由各自的进程和配置管理。新脚本不会查找旧项目的注释、路由目录或配置文件。

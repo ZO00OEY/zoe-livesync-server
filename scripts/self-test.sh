@@ -6,6 +6,7 @@ root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bash -n "${root_dir}/install.sh"
 bash -n "${root_dir}/manage.sh"
 sh -n "${root_dir}/scripts/couchdb-init.sh"
+bash -n "${root_dir}/scripts/generate-setup-uri.sh"
 
 # shellcheck disable=SC1091
 source "${root_dir}/install.sh" --source-only

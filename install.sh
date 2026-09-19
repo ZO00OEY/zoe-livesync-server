@@ -12,6 +12,8 @@ COUCHDB_USER="${COUCHDB_USER:-obsidian_user}"
 COUCHDB_DATABASE="${COUCHDB_DATABASE:-obsidiannotes}"
 HTTPS_PORT="${HTTPS_PORT:-}"
 PUBLIC_URL=""
+VAULT_PASSPHRASE="${VAULT_PASSPHRASE:-}"
+SETUP_URI_PASSPHRASE="${SETUP_URI_PASSPHRASE:-}"
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[1;33m'; cyan='\033[0;36m'; reset='\033[0m'
 info() { printf "%b[信息]%b %s\n" "${cyan}" "${reset}" "$*"; }
@@ -284,7 +286,7 @@ port_is_busy() {
 }
 
 select_https_port() {
-    local stored_port="" candidate
+    local stored_port="" candidate random_value
     if [[ -f "${INSTALL_DIR}/.env" ]]; then
         stored_port="$(sed -n 's/^HTTPS_PORT=//p' "${INSTALL_DIR}/.env" | head -n 1)"
     fi
@@ -300,13 +302,15 @@ select_https_port() {
             fi
         fi
     else
-        for candidate in 443 8443 9443 10443; do
+        for _ in {1..100}; do
+            random_value="$(od -An -N4 -tu4 /dev/urandom | tr -d '[:space:]')"
+            candidate=$((20000 + random_value % 10000))
             if ! port_is_busy "${candidate}"; then
                 HTTPS_PORT="${candidate}"
                 break
             fi
         done
-        [[ -n "${HTTPS_PORT}" ]] || die "443、8443、9443、10443 均被占用，请通过 HTTPS_PORT 指定空闲端口。"
+        [[ -n "${HTTPS_PORT}" ]] || die "连续 100 次都未找到空闲随机端口，请通过 HTTPS_PORT 手动指定。"
     fi
 
     if [[ "${HTTPS_PORT}" == "443" ]]; then
@@ -314,8 +318,7 @@ select_https_port() {
     else
         PUBLIC_URL="https://${PUBLIC_IP}:${HTTPS_PORT}"
     fi
-    info "独立 HTTPS 端口：${HTTPS_PORT}"
-    info "LiveSync 地址：${PUBLIC_URL}"
+    info "已选定独立随机 HTTPS 端口：${HTTPS_PORT}"
 }
 
 prepare_files() {
@@ -323,9 +326,11 @@ prepare_files() {
     install -m 0644 "${SOURCE_DIR}/compose.yaml" "${INSTALL_DIR}/compose.yaml"
     install -m 0644 "${SOURCE_DIR}/config/livesync.ini" "${INSTALL_DIR}/config/livesync.ini"
     install -m 0755 "${SOURCE_DIR}/scripts/couchdb-init.sh" "${INSTALL_DIR}/scripts/couchdb-init.sh"
+    install -m 0755 "${SOURCE_DIR}/scripts/generate-setup-uri.sh" "${INSTALL_DIR}/scripts/generate-setup-uri.sh"
     install -m 0755 "${SOURCE_DIR}/manage.sh" "${INSTALL_DIR}/manage.sh"
 
     local password="${COUCHDB_PASSWORD:-}" confirmed_ip="${PUBLIC_IP}" confirmed_url="${PUBLIC_URL}" confirmed_port="${HTTPS_PORT}"
+    local requested_vault_passphrase="${VAULT_PASSPHRASE}" requested_uri_passphrase="${SETUP_URI_PASSPHRASE}"
     if [[ -f "${INSTALL_DIR}/.env" ]]; then
         # shellcheck source=/dev/null
         source "${INSTALL_DIR}/.env"
@@ -334,7 +339,11 @@ prepare_files() {
     PUBLIC_IP="${confirmed_ip}"
     PUBLIC_URL="${confirmed_url}"
     HTTPS_PORT="${confirmed_port}"
+    [[ -n "${requested_vault_passphrase}" ]] && VAULT_PASSPHRASE="${requested_vault_passphrase}"
+    [[ -n "${requested_uri_passphrase}" ]] && SETUP_URI_PASSPHRASE="${requested_uri_passphrase}"
     [[ -n "${password}" ]] || password="$(openssl rand -hex 32)"
+    [[ -n "${VAULT_PASSPHRASE}" ]] || VAULT_PASSPHRASE="$(openssl rand -hex 24)"
+    [[ -n "${SETUP_URI_PASSPHRASE}" ]] || SETUP_URI_PASSPHRASE="$(openssl rand -hex 24)"
     cat > "${INSTALL_DIR}/.env" <<EOF
 COUCHDB_USER=${COUCHDB_USER}
 COUCHDB_PASSWORD=${password}
@@ -342,6 +351,8 @@ COUCHDB_DATABASE=${COUCHDB_DATABASE}
 PUBLIC_IP=${PUBLIC_IP}
 PUBLIC_URL=${PUBLIC_URL}
 HTTPS_PORT=${HTTPS_PORT}
+VAULT_PASSPHRASE=${VAULT_PASSPHRASE}
+SETUP_URI_PASSPHRASE=${SETUP_URI_PASSPHRASE}
 EOF
     chmod 0600 "${INSTALL_DIR}/.env"
     COUCHDB_PASSWORD="${password}"
@@ -458,13 +469,14 @@ wait_for_couchdb() {
 
 write_connection_file() {
     cat > "${INSTALL_DIR}/connection.txt" <<EOF
-Zoe LiveSync / Self-hosted LiveSync 连接信息
+第一部分：CouchDB API 连接信息
 
-Remote type: CouchDB
-URI: ${PUBLIC_URL}
-Username: ${COUCHDB_USER}
-Password: ${COUCHDB_PASSWORD}
-Database: ${COUCHDB_DATABASE}
+API 类型: CouchDB
+API URL: ${PUBLIC_URL}
+HTTPS 端口: ${HTTPS_PORT}
+用户名: ${COUCHDB_USER}
+密码: ${COUCHDB_PASSWORD}
+数据库: ${COUCHDB_DATABASE}
 
 注意：首次设备请使用一个单独保存的端到端加密口令；它不是上面的 CouchDB 密码。
 EOF
@@ -486,10 +498,12 @@ usage() {
 
 环境变量：
   PUBLIC_IP          明确指定公网 IPv4
-  HTTPS_PORT         独立 HTTPS 端口；默认依次选择 443、8443、9443、10443
+  HTTPS_PORT         可选；不指定时随机选择 20000-29999 中的空闲端口
   COUCHDB_USER       CouchDB 用户名，默认 obsidian_user
   COUCHDB_PASSWORD   CouchDB 密码；不指定则随机生成
   COUCHDB_DATABASE   数据库名，默认 obsidiannotes
+  VAULT_PASSPHRASE   可选；Self-hosted LiveSync 端到端加密口令
+  SETUP_URI_PASSPHRASE  可选；快速导入配置的保护口令
   ZOE_INSTALL_DIR    安装目录，默认 /opt/zoe-livesync-server
 EOF
 }
@@ -520,6 +534,12 @@ main() {
     if [[ -n "${COUCHDB_PASSWORD:-}" ]]; then
         [[ "${COUCHDB_PASSWORD}" =~ ^[A-Za-z0-9._~!@%+=:-]{16,128}$ ]] || die "COUCHDB_PASSWORD 需为 16-128 位安全字符。"
     fi
+    if [[ -n "${VAULT_PASSPHRASE}" ]]; then
+        [[ "${VAULT_PASSPHRASE}" =~ ^[A-Za-z0-9._~!@%+=:-]{20,128}$ ]] || die "VAULT_PASSPHRASE 需为 20-128 位安全字符。"
+    fi
+    if [[ -n "${SETUP_URI_PASSPHRASE}" ]]; then
+        [[ "${SETUP_URI_PASSPHRASE}" =~ ^[A-Za-z0-9._~!@%+=:-]{20,128}$ ]] || die "SETUP_URI_PASSPHRASE 需为 20-128 位安全字符。"
+    fi
     detect_system
     install_base_packages
     ensure_docker
@@ -537,12 +557,21 @@ main() {
     compose --profile https exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
     write_connection_file
     verify_installation
+    "${INSTALL_DIR}/scripts/generate-setup-uri.sh" >/dev/null
 
     echo
-    echo "安装完成。Self-hosted LiveSync 填写："
+    echo "============================================================"
+    echo "  以下信息都很重要，请完整保存，不要公开发送"
+    echo "============================================================"
+    echo
     cat "${INSTALL_DIR}/connection.txt"
     echo
-    echo "连接信息保存于：${INSTALL_DIR}/connection.txt（权限 600）"
+    cat "${INSTALL_DIR}/setup-uri.txt"
+    echo
+    echo "以上信息另存于："
+    echo "  ${INSTALL_DIR}/connection.txt"
+    echo "  ${INSTALL_DIR}/setup-uri.txt"
+    echo "两个文件权限均为 600。"
     echo "管理命令：${INSTALL_DIR}/manage.sh status"
 }
 
