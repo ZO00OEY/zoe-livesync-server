@@ -1,5 +1,3 @@
-name: zoe-livesync
-
 services:
   couchdb:
     image: couchdb:3.5.2.1

@@ -271,9 +271,9 @@ ensure_docker() {
 
 compose() {
     if docker compose version >/dev/null 2>&1; then
-        docker compose --project-directory "${INSTALL_DIR}" -f "${INSTALL_DIR}/compose.yaml" "$@"
+        docker compose -p zoe-livesync --project-directory "${INSTALL_DIR}" -f "${INSTALL_DIR}/compose.yaml" "$@"
     else
-        docker-compose --project-directory "${INSTALL_DIR}" -f "${INSTALL_DIR}/compose.yaml" "$@"
+        docker-compose -p zoe-livesync --project-directory "${INSTALL_DIR}" -f "${INSTALL_DIR}/compose.yaml" "$@"
     fi
 }
 
@@ -391,9 +391,9 @@ install_renewal_helpers() {
 set -eu
 cd "${INSTALL_DIR}"
 if docker compose version >/dev/null 2>&1; then
-    docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+    docker compose -p zoe-livesync exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 else
-    docker-compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+    docker-compose -p zoe-livesync exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 fi
 EOF
     cat > /usr/local/sbin/zoe-livesync-renew <<EOF

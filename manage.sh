@@ -16,9 +16,9 @@ set +a
 
 compose() {
     if docker compose version >/dev/null 2>&1; then
-        docker compose --project-directory "${install_dir}" -f "${install_dir}/compose.yaml" "$@"
+        docker compose -p zoe-livesync --project-directory "${install_dir}" -f "${install_dir}/compose.yaml" "$@"
     else
-        docker-compose --project-directory "${install_dir}" -f "${install_dir}/compose.yaml" "$@"
+        docker-compose -p zoe-livesync --project-directory "${install_dir}" -f "${install_dir}/compose.yaml" "$@"
     fi
 }
 
